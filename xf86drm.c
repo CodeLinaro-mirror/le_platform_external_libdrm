@@ -68,9 +68,6 @@
 
 #include "xf86drm.h"
 #include "libdrm_macros.h"
-#ifdef DRM_FE
-#include "fe_drm.h"
-#endif
 
 #include "util_math.h"
 

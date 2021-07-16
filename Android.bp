@@ -65,7 +65,5 @@ cc_library {
         "-Wno-pointer-arith",
         "-Wno-sign-compare",
         "-Wno-tautological-compare",
-        "-DDRM_FE",
-        "-DLIBDIR=\"/vendor/lib64\"",
     ],
 }
