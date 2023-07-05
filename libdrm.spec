@@ -26,8 +26,8 @@ header files libdrm
 # ninja injects -Wl,--no-undefined, which intereferes with LTO, so undo
 # the setting.  Thanks to the SuSE folks for the workaround.
 export LDFLAGS="%{?build_ldflags} -Wl,-z,undefs"
-export CPPFLAGS="-Denable_drm-fe=yes"
-%meson
+
+%meson -Denable_drm-fe=yes -Dman_pages=false
 %meson_build
 
 %install

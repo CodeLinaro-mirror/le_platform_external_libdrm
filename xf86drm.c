@@ -1780,11 +1780,8 @@ drm_public int drmClose(int fd)
     drm_intf_fe = get_drm_fe();
     if (drm_intf_fe)
         drm_intf_fe->drmclose_fe(fd);
-
-    return drmClose(fd);
-#else
-    return close(fd);
 #endif
+    return close(fd);
 }
 
 
