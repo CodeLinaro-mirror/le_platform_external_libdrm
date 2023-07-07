@@ -24,10 +24,6 @@
  *    Inki Dae <inki.dae@samsung.com>
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,7 +48,7 @@
  *
  * if true, return the device object else NULL.
  */
-struct exynos_device * exynos_device_create(int fd)
+drm_public struct exynos_device * exynos_device_create(int fd)
 {
 	struct exynos_device *dev;
 
@@ -73,7 +69,7 @@ struct exynos_device * exynos_device_create(int fd)
  *
  * @dev: exynos drm device object.
  */
-void exynos_device_destroy(struct exynos_device *dev)
+drm_public void exynos_device_destroy(struct exynos_device *dev)
 {
 	free(dev);
 }
@@ -91,8 +87,8 @@ void exynos_device_destroy(struct exynos_device *dev)
  *
  * if true, return a exynos buffer object else NULL.
  */
-struct exynos_bo * exynos_bo_create(struct exynos_device *dev,
-					       size_t size, uint32_t flags)
+drm_public struct exynos_bo * exynos_bo_create(struct exynos_device *dev,
+                                               size_t size, uint32_t flags)
 {
 	struct exynos_bo *bo;
 	struct drm_exynos_gem_create req = {
@@ -145,8 +141,8 @@ fail:
  *
  * if true, return 0 else negative.
  */
-int exynos_bo_get_info(struct exynos_device *dev, uint32_t handle,
-				  size_t *size, uint32_t *flags)
+drm_public int exynos_bo_get_info(struct exynos_device *dev, uint32_t handle,
+                                  size_t *size, uint32_t *flags)
 {
 	int ret;
 	struct drm_exynos_gem_info req = {
@@ -171,7 +167,7 @@ int exynos_bo_get_info(struct exynos_device *dev, uint32_t handle,
  *
  * @bo: a exynos buffer object to be destroyed.
  */
-void exynos_bo_destroy(struct exynos_bo *bo)
+drm_public void exynos_bo_destroy(struct exynos_bo *bo)
 {
 	if (!bo)
 		return;
@@ -180,11 +176,7 @@ void exynos_bo_destroy(struct exynos_bo *bo)
 		munmap(bo->vaddr, bo->size);
 
 	if (bo->handle) {
-		struct drm_gem_close req = {
-			.handle = bo->handle,
-		};
-
-		drmIoctl(bo->dev->fd, DRM_IOCTL_GEM_CLOSE, &req);
+		drmCloseBufferHandle(bo->dev->fd, bo->handle);
 	}
 
 	free(bo);
@@ -203,7 +195,7 @@ void exynos_bo_destroy(struct exynos_bo *bo)
  * if true, return a exynos buffer object else NULL.
  *
  */
-struct exynos_bo *
+drm_public struct exynos_bo *
 exynos_bo_from_name(struct exynos_device *dev, uint32_t name)
 {
 	struct exynos_bo *bo;
@@ -246,7 +238,7 @@ err_free_bo:
  *
  * if true, return 0 else negative.
  */
-int exynos_bo_get_name(struct exynos_bo *bo, uint32_t *name)
+drm_public int exynos_bo_get_name(struct exynos_bo *bo, uint32_t *name)
 {
 	if (!bo->name) {
 		struct drm_gem_flink req = {
@@ -269,7 +261,7 @@ int exynos_bo_get_name(struct exynos_bo *bo, uint32_t *name)
 	return 0;
 }
 
-uint32_t exynos_bo_handle(struct exynos_bo *bo)
+drm_public uint32_t exynos_bo_handle(struct exynos_bo *bo)
 {
 	return bo->handle;
 }
@@ -280,9 +272,9 @@ uint32_t exynos_bo_handle(struct exynos_bo *bo)
  * @bo: a exynos buffer object including a gem object handle to be mmapped
  *	to user space.
  *
- * if true, user pointer mmaped else NULL.
+ * if true, user pointer mmapped else NULL.
  */
-void *exynos_bo_map(struct exynos_bo *bo)
+drm_public void *exynos_bo_map(struct exynos_bo *bo)
 {
 	if (!bo->vaddr) {
 		struct exynos_device *dev = bo->dev;
@@ -319,7 +311,7 @@ void *exynos_bo_map(struct exynos_bo *bo)
  *
  * @return: 0 on success, -1 on error, and errno will be set
  */
-int
+drm_public int
 exynos_prime_handle_to_fd(struct exynos_device *dev, uint32_t handle, int *fd)
 {
 	return drmPrimeHandleToFD(dev->fd, handle, 0, fd);
@@ -334,7 +326,7 @@ exynos_prime_handle_to_fd(struct exynos_device *dev, uint32_t handle, int *fd)
  *
  * @return: 0 on success, -1 on error, and errno will be set
  */
-int
+drm_public int
 exynos_prime_fd_to_handle(struct exynos_device *dev, int fd, uint32_t *handle)
 {
 	return drmPrimeFDToHandle(dev->fd, fd, handle);
@@ -347,7 +339,7 @@ exynos_prime_fd_to_handle(struct exynos_device *dev, int fd, uint32_t *handle)
  *
  * @dev: a exynos device object.
  * @connect: indicate whether connectoin or disconnection request.
- * @ext: indicate whether edid data includes extentions data or not.
+ * @ext: indicate whether edid data includes extensions data or not.
  * @edid: a pointer to edid data from Wireless Display device.
  *
  * this interface is used to request Virtual Display driver connection or
@@ -357,7 +349,7 @@ exynos_prime_fd_to_handle(struct exynos_device *dev, int fd, uint32_t *handle)
  *
  * if true, return 0 else negative.
  */
-int
+drm_public int
 exynos_vidi_connection(struct exynos_device *dev, uint32_t connect,
 		       uint32_t ext, void *edid)
 {
@@ -398,7 +390,7 @@ exynos_handle_vendor(int fd, struct drm_event *e, void *ctx)
 	}
 }
 
-int
+drm_public int
 exynos_handle_event(struct exynos_device *dev, struct exynos_event_context *ctx)
 {
 	char buffer[1024];
@@ -417,7 +409,7 @@ exynos_handle_event(struct exynos_device *dev, struct exynos_event_context *ctx)
 
 	i = 0;
 	while (i < len) {
-		e = (struct drm_event *) &buffer[i];
+		e = (struct drm_event *)(buffer + i);
 		switch (e->type) {
 		case DRM_EVENT_VBLANK:
 			if (evctx->version < 1 ||

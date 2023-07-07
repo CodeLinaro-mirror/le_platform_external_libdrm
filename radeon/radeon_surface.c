@@ -26,9 +26,6 @@
  * Authors:
  *      Jérôme Glisse <jglisse@redhat.com>
  */
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
 #include <stdbool.h>
 #include <assert.h>
 #include <errno.h>
@@ -41,6 +38,14 @@
 #include "xf86drm.h"
 #include "radeon_drm.h"
 #include "radeon_surface.h"
+
+#define CIK_TILE_MODE_COLOR_2D			14
+#define CIK_TILE_MODE_COLOR_2D_SCANOUT		10
+#define CIK_TILE_MODE_DEPTH_STENCIL_2D_TILESPLIT_64       0
+#define CIK_TILE_MODE_DEPTH_STENCIL_2D_TILESPLIT_128      1
+#define CIK_TILE_MODE_DEPTH_STENCIL_2D_TILESPLIT_256      2
+#define CIK_TILE_MODE_DEPTH_STENCIL_2D_TILESPLIT_512      3
+#define CIK_TILE_MODE_DEPTH_STENCIL_2D_TILESPLIT_ROW_SIZE 4
 
 #define ALIGN(value, alignment) (((value) + alignment - 1) & ~(alignment - 1))
 #define MAX2(A, B)              ((A) > (B) ? (A) : (B))
@@ -957,8 +962,10 @@ static int eg_surface_best(struct radeon_surface_manager *surf_man,
             }
             surf->stencil_tile_split = 64;
         } else {
-            /* tile split must be >= 256 for colorbuffer surfaces */
-            surf->tile_split = MAX2(surf->nsamples * surf->bpe * 64, 256);
+            /* tile split must be >= 256 for colorbuffer surfaces,
+             * SAMPLE_SPLIT = tile_split / (bpe * 64), the optimal value is 2
+             */
+            surf->tile_split = MAX2(2 * surf->bpe * 64, 256);
             if (surf->tile_split > 4096)
                 surf->tile_split = 4096;
         }
@@ -971,7 +978,7 @@ static int eg_surface_best(struct radeon_surface_manager *surf_man,
     /* bankw or bankh greater than 1 increase alignment requirement, not
      * sure if it's worth using smaller bankw & bankh to stick with 2D
      * tiling on small surface rather than falling back to 1D tiling.
-     * Use recommanded value based on tile size for now.
+     * Use recommended value based on tile size for now.
      *
      * fmask buffer has different optimal value figure them out once we
      * use it.
@@ -2401,7 +2408,7 @@ static int cik_surface_best(struct radeon_surface_manager *surf_man,
 /* ===========================================================================
  * public API
  */
-struct radeon_surface_manager *
+drm_public struct radeon_surface_manager *
 radeon_surface_manager_new(int fd)
 {
     struct radeon_surface_manager *surf_man;
@@ -2450,7 +2457,7 @@ out_err:
     return NULL;
 }
 
-void
+drm_public void
 radeon_surface_manager_free(struct radeon_surface_manager *surf_man)
 {
     free(surf_man);
@@ -2493,6 +2500,7 @@ static int radeon_surface_sanity(struct radeon_surface_manager *surf_man,
         if (surf->npix_y > 1) {
             return -EINVAL;
         }
+        /* fallthrough */
     case RADEON_SURF_TYPE_2D:
         if (surf->npix_z > 1) {
             return -EINVAL;
@@ -2523,7 +2531,7 @@ static int radeon_surface_sanity(struct radeon_surface_manager *surf_man,
     return 0;
 }
 
-int
+drm_public int
 radeon_surface_init(struct radeon_surface_manager *surf_man,
                     struct radeon_surface *surf)
 {
@@ -2540,7 +2548,7 @@ radeon_surface_init(struct radeon_surface_manager *surf_man,
     return surf_man->surface_init(surf_man, surf);
 }
 
-int
+drm_public int
 radeon_surface_best(struct radeon_surface_manager *surf_man,
                     struct radeon_surface *surf)
 {

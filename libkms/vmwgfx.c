@@ -25,9 +25,8 @@
  *
  **************************************************************************/
 
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
+#ifdef __FreeBSD__
+#define _WANT_KERNEL_ERRNO
 #endif
 
 #include <errno.h>

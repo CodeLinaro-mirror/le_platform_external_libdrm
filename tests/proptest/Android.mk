@@ -10,4 +10,5 @@ LOCAL_MODULE := proptest
 LOCAL_SHARED_LIBRARIES := libdrm
 LOCAL_STATIC_LIBRARIES := libdrm_util
 
+include $(LIBDRM_COMMON_MK)
 include $(BUILD_EXECUTABLE)

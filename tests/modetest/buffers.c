@@ -24,10 +24,6 @@
  * IN THE SOFTWARE.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
@@ -52,150 +48,12 @@ struct bo
 	size_t offset;
 	size_t pitch;
 	unsigned handle;
-#ifdef USE_ION
-	unsigned ihdl;
-	int ion_fd;
-	int ion_map_fd;
-#endif
 };
 
 /* -----------------------------------------------------------------------------
  * Buffers management
  */
-#ifdef USE_ION
-#include <fcntl.h>
-#include <unistd.h>
 
-#include <linux/msm_ion.h>
-
-static struct bo *
-bo_create_dumb(int fd, unsigned int width, unsigned int height, unsigned int bpp)
-{
-	struct ion_allocation_data ion_alloc_data;
-	struct ion_fd_data fd_data;
-	struct bo *bo;
-	int ion_fd, ret;
-	size_t page_size, frame_size;
-	struct drm_prime_handle prime_req;
-
-	ion_fd = open("/dev/ion", O_RDWR | O_DSYNC);
-	if (ion_fd < 0) {
-		fprintf(stderr, "failed to open ion for allocation\n");
-		return NULL;
-	}
-
-	bo = malloc(sizeof(*bo));
-	if (bo == NULL) {
-		close(ion_fd);
-		fprintf(stderr, "failed to allocate buffer object\n");
-		return NULL;
-	}
-
-	page_size = sysconf(_SC_PAGESIZE);
-
-	bo->pitch = width * bpp / 8;
-	frame_size = bo->pitch  * height;
-
-	/* round up to page size) */
-	bo->size = (frame_size + page_size - 1) & (~(page_size - 1));
-	bo->offset = 0;
-	bo->fd = fd; /* drm fd */
-	bo->ion_fd = ion_fd; /* ion fd */
-
-	memset(&ion_alloc_data, 0, sizeof(ion_alloc_data));
-	ion_alloc_data.len = bo->size;
-	ion_alloc_data.align = page_size;
-	ion_alloc_data.heap_id_mask = ION_HEAP(ION_SYSTEM_HEAP_ID);
-	ion_alloc_data.flags = 0;
-
-	ret = ioctl(ion_fd, ION_IOC_ALLOC, &ion_alloc_data);
-	if (ret) {
-		fprintf(stderr, "failed to allocate memory from ion: %s\n",
-			strerror(errno));
-		goto error;
-	}
-
-	bo->ihdl = ion_alloc_data.handle;
-	fd_data.handle = bo->ihdl;
-
-	ret = ioctl(ion_fd, ION_IOC_MAP, &fd_data);
-	if (ret) {
-		fprintf(stderr, "failed to map ion memory: %s\n",
-			strerror(errno));
-		goto error;
-	}
-
-	bo->ion_map_fd = fd_data.fd;
-
-	prime_req.fd = fd_data.fd;
-	ret = drmIoctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime_req);
-	if (ret) {
-		close(fd_data.fd);
-		fprintf(stderr, "failed get prime handle: %s\n",
-			strerror(errno));
-		goto error;
-	}
-
-	bo->handle = prime_req.handle;
-
-	return bo;
-
-error:
-	if (ion_alloc_data.handle) {
-		struct ion_handle_data hdl_data = {
-			.handle = ion_alloc_data.handle,
-		};
-		ioctl(bo->ion_fd, ION_IOC_FREE, &hdl_data);
-	}
-
-	close(ion_fd);
-	free(bo);
-	return NULL;
-}
-
-static int bo_map(struct bo *bo, void **out)
-{
-	void *map;
-
-	map = drm_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-		       bo->ion_map_fd, bo->offset);
-	if (map == MAP_FAILED)
-		return -EINVAL;
-
-	bo->ptr = map;
-	*out = map;
-
-	return 0;
-}
-
-static void bo_unmap(struct bo *bo)
-{
-	if (!bo->ptr)
-		return;
-
-	drm_munmap(bo->ptr, bo->size);
-	bo->ptr = NULL;
-}
-
-void bo_destroy(struct bo *bo)
-{
-	struct ion_handle_data hdl_data = {
-		.handle = bo->ihdl,
-	};
-	int ret;
-
-	bo_unmap(bo);
-	close(bo->ion_map_fd);
-
-	ret = ioctl(bo->ion_fd, ION_IOC_FREE, &hdl_data);
-	if (ret)
-		fprintf(stderr, "failed to free ion buffer: %s\n",
-			strerror(errno));
-
-	close(bo->ion_fd);
-	free(bo);
-}
-#else
 static struct bo *
 bo_create_dumb(int fd, unsigned int width, unsigned int height, unsigned int bpp)
 {
@@ -262,7 +120,6 @@ static void bo_unmap(struct bo *bo)
 	drm_munmap(bo->ptr, bo->size);
 	bo->ptr = NULL;
 }
-#endif
 
 struct bo *
 bo_create(int fd, unsigned int format,
@@ -278,6 +135,7 @@ bo_create(int fd, unsigned int format,
 	int ret;
 
 	switch (format) {
+	case DRM_FORMAT_C8:
 	case DRM_FORMAT_NV12:
 	case DRM_FORMAT_NV21:
 	case DRM_FORMAT_NV16:
@@ -334,6 +192,13 @@ bo_create(int fd, unsigned int format,
 	case DRM_FORMAT_BGRA1010102:
 	case DRM_FORMAT_BGRX1010102:
 		bpp = 32;
+		break;
+
+	case DRM_FORMAT_XRGB16161616F:
+	case DRM_FORMAT_XBGR16161616F:
+	case DRM_FORMAT_ARGB16161616F:
+	case DRM_FORMAT_ABGR16161616F:
+		bpp = 64;
 		break;
 
 	default:
@@ -418,6 +283,7 @@ bo_create(int fd, unsigned int format,
 		planes[2] = virtual + offsets[2];
 		break;
 
+	case DRM_FORMAT_C8:
 	case DRM_FORMAT_ARGB4444:
 	case DRM_FORMAT_XRGB4444:
 	case DRM_FORMAT_ABGR4444:
@@ -454,6 +320,10 @@ bo_create(int fd, unsigned int format,
 	case DRM_FORMAT_RGBX1010102:
 	case DRM_FORMAT_BGRA1010102:
 	case DRM_FORMAT_BGRX1010102:
+	case DRM_FORMAT_XRGB16161616F:
+	case DRM_FORMAT_XBGR16161616F:
+	case DRM_FORMAT_ARGB16161616F:
+	case DRM_FORMAT_ABGR16161616F:
 		offsets[0] = 0;
 		handles[0] = bo->handle;
 		pitches[0] = bo->pitch;
@@ -468,7 +338,6 @@ bo_create(int fd, unsigned int format,
 	return bo;
 }
 
-#ifndef USE_ION
 void bo_destroy(struct bo *bo)
 {
 	struct drm_mode_destroy_dumb arg;
@@ -484,4 +353,3 @@ void bo_destroy(struct bo *bo)
 
 	free(bo);
 }
-#endif

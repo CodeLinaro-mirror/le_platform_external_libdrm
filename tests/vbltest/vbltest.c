@@ -24,10 +24,6 @@
  * IN THE SOFTWARE.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,8 +31,11 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/time.h>
+#if HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
 #include "xf86drm.h"
 #include "xf86drmMode.h"
@@ -120,7 +119,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	fd = util_open(module, device);
+	fd = util_open(device, module);
 	if (fd < 0)
 		return 1;
 

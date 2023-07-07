@@ -21,10 +21,6 @@
  * IN THE SOFTWARE.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -38,8 +34,6 @@
 #include "intel_chipset.h"
 #include "intel_bufmgr.h"
 
-/* The compiler throws ~90 warnings. Do not spam the build, until we fix them. */
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
 /* Struct for tracking drm_intel_decode state. */
 struct drm_intel_decode {
@@ -3600,7 +3594,7 @@ decode_3d_965(struct drm_intel_decode *ctx)
 		instr_out(ctx, 0, "3DSTATE_DEPTH_BUFFER\n");
 		if (IS_GEN5(devid) || IS_GEN6(devid))
 			instr_out(ctx, 1,
-				  "%s, %s, pitch = %d bytes, %stiled, HiZ %d, Seperate Stencil %d\n",
+				  "%s, %s, pitch = %d bytes, %stiled, HiZ %d, Separate Stencil %d\n",
 				  get_965_surfacetype(data[1] >> 29),
 				  get_965_depthformat((data[1] >> 18) & 0x7),
 				  (data[1] & 0x0001ffff) + 1,
@@ -3817,54 +3811,57 @@ decode_3d_i830(struct drm_intel_decode *ctx)
 	return 1;
 }
 
-struct drm_intel_decode *
+drm_public struct drm_intel_decode *
 drm_intel_decode_context_alloc(uint32_t devid)
 {
 	struct drm_intel_decode *ctx;
+	int gen = 0;
+
+	if (intel_get_genx(devid, &gen))
+		;
+	else if (IS_GEN8(devid))
+		gen = 8;
+	else if (IS_GEN7(devid))
+		gen = 7;
+	else if (IS_GEN6(devid))
+		gen = 6;
+	else if (IS_GEN5(devid))
+		gen = 5;
+	else if (IS_GEN4(devid))
+		gen = 4;
+	else if (IS_9XX(devid))
+		gen = 3;
+	else if (IS_GEN2(devid))
+		gen = 2;
+
+	if (!gen)
+		return NULL;
 
 	ctx = calloc(1, sizeof(struct drm_intel_decode));
 	if (!ctx)
 		return NULL;
 
 	ctx->devid = devid;
+	ctx->gen = gen;
 	ctx->out = stdout;
-
-	if (IS_GEN9(devid))
-		ctx->gen = 9;
-	else if (IS_GEN8(devid))
-		ctx->gen = 8;
-	else if (IS_GEN7(devid))
-		ctx->gen = 7;
-	else if (IS_GEN6(devid))
-		ctx->gen = 6;
-	else if (IS_GEN5(devid))
-		ctx->gen = 5;
-	else if (IS_GEN4(devid))
-		ctx->gen = 4;
-	else if (IS_9XX(devid))
-		ctx->gen = 3;
-	else {
-		assert(IS_GEN2(devid));
-		ctx->gen = 2;
-	}
 
 	return ctx;
 }
 
-void
+drm_public void
 drm_intel_decode_context_free(struct drm_intel_decode *ctx)
 {
 	free(ctx);
 }
 
-void
+drm_public void
 drm_intel_decode_set_dump_past_end(struct drm_intel_decode *ctx,
 				   int dump_past_end)
 {
 	ctx->dump_past_end = !!dump_past_end;
 }
 
-void
+drm_public void
 drm_intel_decode_set_batch_pointer(struct drm_intel_decode *ctx,
 				   void *data, uint32_t hw_offset, int count)
 {
@@ -3873,7 +3870,7 @@ drm_intel_decode_set_batch_pointer(struct drm_intel_decode *ctx,
 	ctx->base_count = count;
 }
 
-void
+drm_public void
 drm_intel_decode_set_head_tail(struct drm_intel_decode *ctx,
 			       uint32_t head, uint32_t tail)
 {
@@ -3881,7 +3878,7 @@ drm_intel_decode_set_head_tail(struct drm_intel_decode *ctx,
 	ctx->tail = tail;
 }
 
-void
+drm_public void
 drm_intel_decode_set_output_file(struct drm_intel_decode *ctx,
 				 FILE *output)
 {
@@ -3895,13 +3892,13 @@ drm_intel_decode_set_output_file(struct drm_intel_decode *ctx,
  * \param count number of DWORDs to decode in the batch buffer
  * \param hw_offset hardware address for the buffer
  */
-void
+drm_public void
 drm_intel_decode(struct drm_intel_decode *ctx)
 {
 	int ret;
 	unsigned int index = 0;
 	uint32_t devid;
-	int size = ctx->base_count * 4;
+	int size;
 	void *temp;
 
 	if (!ctx)
@@ -3911,6 +3908,7 @@ drm_intel_decode(struct drm_intel_decode *ctx)
 	 * the batchbuffer.  This lets us avoid a bunch of length
 	 * checking in statically sized packets.
 	 */
+	size = ctx->base_count * 4;
 	temp = malloc(size + 4096);
 	memcpy(temp, ctx->base_data, size);
 	memset((char *)temp + size, 0xd0, 4096);

@@ -1,19 +1,17 @@
 DRM_GPU_DRIVERS := $(strip $(filter-out swrast, $(BOARD_GPU_DRIVERS)))
 
-intel_drivers := i915 i965 i915g ilo
+intel_drivers := i915 i965 i915g iris
 radeon_drivers := r300g r600g radeonsi
-rockchip_drivers := rockchip
 nouveau_drivers := nouveau
+virgl_drivers := virgl
 vmwgfx_drivers := vmwgfx
-tegra_drivers := tegra
 
 valid_drivers := \
 	$(intel_drivers) \
 	$(radeon_drivers) \
-	$(rockchip_drivers) \
 	$(nouveau_drivers) \
-	$(vmwgfx_drivers) \
-	$(tegra_drivers)
+	$(virgl_drivers) \
+	$(vmwgfx_drivers)
 
 # warn about invalid drivers
 invalid_drivers := $(filter-out $(valid_drivers), $(DRM_GPU_DRIVERS))
@@ -46,10 +44,8 @@ ifneq ($(filter $(radeon_drivers), $(DRM_GPU_DRIVERS)),)
 LOCAL_SRC_FILES += $(LIBKMS_RADEON_FILES)
 endif
 
-LOCAL_SRC_FILES := $(filter-out %.h,$(LOCAL_SRC_FILES))
-
 LOCAL_MODULE := libkms
-LOCAL_MODULE_TAGS := optional
 LOCAL_SHARED_LIBRARIES := libdrm
 
+include $(LIBDRM_COMMON_MK)
 include $(BUILD_SHARED_LIBRARY)

@@ -22,10 +22,6 @@
  * Authors: Ben Skeggs
  */
 
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -33,6 +29,7 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include <xf86drm.h>
 #include <xf86atomic.h>
@@ -278,9 +275,10 @@ pushbuf_dump(struct nouveau_pushbuf_krec *krec, int krec_id, int chid)
 
 	kref = krec->buffer;
 	for (i = 0; i < krec->nr_buffer; i++, kref++) {
-		err("ch%d: buf %08x %08x %08x %08x %08x\n", chid, i,
+		bo = (void *)(uintptr_t)kref->user_priv;
+		err("ch%d: buf %08x %08x %08x %08x %08x %p 0x%"PRIx64" 0x%"PRIx64"\n", chid, i,
 		    kref->handle, kref->valid_domains,
-		    kref->read_domains, kref->write_domains);
+		    kref->read_domains, kref->write_domains, bo->map, bo->offset, bo->size);
 	}
 
 	krel = krec->reloc;
@@ -296,11 +294,14 @@ pushbuf_dump(struct nouveau_pushbuf_krec *krec, int krec_id, int chid)
 		kref = krec->buffer + kpsh->bo_index;
 		bo = (void *)(unsigned long)kref->user_priv;
 		bgn = (uint32_t *)((char *)bo->map + kpsh->offset);
-		end = bgn + (kpsh->length /4);
+		end = bgn + ((kpsh->length & 0x7fffff) /4);
 
-		err("ch%d: psh %08x %010llx %010llx\n", chid, kpsh->bo_index,
+		err("ch%d: psh %s%08x %010llx %010llx\n", chid,
+		    bo->map ? "" : "(unmapped) ", kpsh->bo_index,
 		    (unsigned long long)kpsh->offset,
 		    (unsigned long long)(kpsh->offset + kpsh->length));
+		if (!bo->map)
+			continue;
 		while (bgn < end)
 			err("\t0x%08x\n", *bgn++);
 	}
@@ -340,6 +341,8 @@ pushbuf_submit(struct nouveau_pushbuf *push, struct nouveau_object *chan)
 		req.suffix0 = nvpb->suffix0;
 		req.suffix1 = nvpb->suffix1;
 		req.vram_available = 0; /* for valgrind */
+		if (dbg_on(1))
+			req.vram_available |= NOUVEAU_GEM_PUSHBUF_SYNC;
 		req.gart_available = 0;
 
 		if (dbg_on(0))
@@ -532,7 +535,7 @@ pushbuf_validate(struct nouveau_pushbuf *push, bool retry)
 	return ret;
 }
 
-int
+drm_public int
 nouveau_pushbuf_new(struct nouveau_client *client, struct nouveau_object *chan,
 		    int nr, uint32_t size, bool immediate,
 		    struct nouveau_pushbuf **ppush)
@@ -603,7 +606,7 @@ nouveau_pushbuf_new(struct nouveau_client *client, struct nouveau_object *chan,
 	return 0;
 }
 
-void
+drm_public void
 nouveau_pushbuf_del(struct nouveau_pushbuf **ppush)
 {
 	struct nouveau_pushbuf_priv *nvpb = nouveau_pushbuf(*ppush);
@@ -629,7 +632,7 @@ nouveau_pushbuf_del(struct nouveau_pushbuf **ppush)
 	*ppush = NULL;
 }
 
-struct nouveau_bufctx *
+drm_public struct nouveau_bufctx *
 nouveau_pushbuf_bufctx(struct nouveau_pushbuf *push, struct nouveau_bufctx *ctx)
 {
 	struct nouveau_bufctx *prev = push->bufctx;
@@ -637,7 +640,7 @@ nouveau_pushbuf_bufctx(struct nouveau_pushbuf *push, struct nouveau_bufctx *ctx)
 	return prev;
 }
 
-int
+drm_public int
 nouveau_pushbuf_space(struct nouveau_pushbuf *push,
 		      uint32_t dwords, uint32_t relocs, uint32_t pushes)
 {
@@ -701,7 +704,7 @@ nouveau_pushbuf_space(struct nouveau_pushbuf *push,
 	return flushed ? pushbuf_validate(push, false) : 0;
 }
 
-void
+drm_public void
 nouveau_pushbuf_data(struct nouveau_pushbuf *push, struct nouveau_bo *bo,
 		     uint64_t offset, uint64_t length)
 {
@@ -732,14 +735,14 @@ nouveau_pushbuf_data(struct nouveau_pushbuf *push, struct nouveau_bo *bo,
 	}
 }
 
-int
+drm_public int
 nouveau_pushbuf_refn(struct nouveau_pushbuf *push,
 		     struct nouveau_pushbuf_refn *refs, int nr)
 {
 	return pushbuf_refn(push, true, refs, nr);
 }
 
-void
+drm_public void
 nouveau_pushbuf_reloc(struct nouveau_pushbuf *push, struct nouveau_bo *bo,
 		      uint32_t data, uint32_t flags, uint32_t vor, uint32_t tor)
 {
@@ -747,13 +750,13 @@ nouveau_pushbuf_reloc(struct nouveau_pushbuf *push, struct nouveau_bo *bo,
 	push->cur++;
 }
 
-int
+drm_public int
 nouveau_pushbuf_validate(struct nouveau_pushbuf *push)
 {
 	return pushbuf_validate(push, true);
 }
 
-uint32_t
+drm_public uint32_t
 nouveau_pushbuf_refd(struct nouveau_pushbuf *push, struct nouveau_bo *bo)
 {
 	struct drm_nouveau_gem_pushbuf_bo *kref;
@@ -771,7 +774,7 @@ nouveau_pushbuf_refd(struct nouveau_pushbuf *push, struct nouveau_bo *bo)
 	return flags;
 }
 
-int
+drm_public int
 nouveau_pushbuf_kick(struct nouveau_pushbuf *push, struct nouveau_object *chan)
 {
 	if (!push->channel)

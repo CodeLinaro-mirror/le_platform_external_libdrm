@@ -21,10 +21,6 @@
  * IN THE SOFTWARE.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <errno.h>
 #include <string.h>
 
@@ -46,7 +42,9 @@ static void kms_screen_probe(struct kms_screen *screen)
 	else
 		screen->connected = false;
 
-	memcpy(&screen->mode, &con->modes[0], sizeof(drmModeModeInfo));
+	if (con->modes)
+		memcpy(&screen->mode, &con->modes[0], sizeof(drmModeModeInfo));
+
 	screen->width = screen->mode.hdisplay;
 	screen->height = screen->mode.vdisplay;
 

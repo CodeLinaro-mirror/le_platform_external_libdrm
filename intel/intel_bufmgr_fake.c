@@ -34,10 +34,6 @@
  * the bugs in the old texture manager.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -245,7 +241,7 @@ FENCE_LTE(unsigned a, unsigned b)
 	return 0;
 }
 
-void
+drm_public void
 drm_intel_bufmgr_fake_set_fence_callback(drm_intel_bufmgr *bufmgr,
 					 unsigned int (*emit) (void *priv),
 					 void (*wait) (unsigned int fence,
@@ -312,7 +308,7 @@ _fence_wait_internal(drm_intel_bufmgr_fake *bufmgr_fake, int seq)
 	 *
 	 * Assume that in userland we treat sequence numbers as ints, which
 	 * makes some of the comparisons convenient, since the sequence
-	 * numbers are all postive signed integers.
+	 * numbers are all positive signed integers.
 	 *
 	 * From this we get several cases we need to handle.  Here's a timeline.
 	 * 0x2   0x7                                    0x7ffffff8   0x7ffffffd
@@ -737,7 +733,7 @@ drm_intel_bufmgr_fake_wait_idle(drm_intel_bufmgr_fake *bufmgr_fake)
 /**
  * Wait for rendering to a buffer to complete.
  *
- * It is assumed that the bathcbuffer which performed the rendering included
+ * It is assumed that the batchbuffer which performed the rendering included
  * the necessary flushing.
  */
 static void
@@ -768,7 +764,7 @@ drm_intel_fake_bo_wait_rendering(drm_intel_bo *bo)
  *  -- just evict everything
  *  -- and wait for idle
  */
-void
+drm_public void
 drm_intel_bufmgr_fake_contended_lock_take(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_fake *bufmgr_fake = (drm_intel_bufmgr_fake *) bufmgr;
@@ -864,7 +860,7 @@ drm_intel_fake_bo_alloc_tiled(drm_intel_bufmgr * bufmgr,
 				       4096);
 }
 
-drm_intel_bo *
+drm_public drm_intel_bo *
 drm_intel_bo_fake_alloc_static(drm_intel_bufmgr *bufmgr,
 			       const char *name,
 			       unsigned long offset,
@@ -959,7 +955,7 @@ drm_intel_fake_bo_unreference(drm_intel_bo *bo)
  * Set the buffer as not requiring backing store, and instead get the callback
  * invoked whenever it would be set dirty.
  */
-void
+drm_public void
 drm_intel_bo_fake_disable_backing_store(drm_intel_bo *bo,
 					void (*invalidate_cb) (drm_intel_bo *bo,
 							       void *ptr),
@@ -1200,7 +1196,7 @@ static int
 		assert(!(bo_fake->flags & (BM_NO_BACKING_STORE | BM_PINNED)));
 
 		/* Actually, should be able to just wait for a fence on the
-		 * mmory, hich we would be tracking when we free it.  Waiting
+		 * memory, which we would be tracking when we free it. Waiting
 		 * for idle is a sufficiently large hammer for now.
 		 */
 		drm_intel_bufmgr_fake_wait_idle(bufmgr_fake);
@@ -1413,7 +1409,7 @@ drm_intel_bo_fake_post_submit(drm_intel_bo *bo)
 	bo_fake->write_domain = 0;
 }
 
-void
+drm_public void
 drm_intel_bufmgr_fake_set_exec_callback(drm_intel_bufmgr *bufmgr,
 					     int (*exec) (drm_intel_bo *bo,
 							  unsigned int used,
@@ -1536,7 +1532,7 @@ drm_intel_fake_check_aperture_space(drm_intel_bo ** bo_array, int count)
  * Used by the X Server on LeaveVT, when the card memory is no longer our
  * own.
  */
-void
+drm_public void
 drm_intel_bufmgr_fake_evict_all(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_fake *bufmgr_fake = (drm_intel_bufmgr_fake *) bufmgr;
@@ -1571,7 +1567,7 @@ drm_intel_bufmgr_fake_evict_all(drm_intel_bufmgr *bufmgr)
 	pthread_mutex_unlock(&bufmgr_fake->lock);
 }
 
-void
+drm_public void
 drm_intel_bufmgr_fake_set_last_dispatch(drm_intel_bufmgr *bufmgr,
 					volatile unsigned int
 					*last_dispatch)
@@ -1581,7 +1577,7 @@ drm_intel_bufmgr_fake_set_last_dispatch(drm_intel_bufmgr *bufmgr,
 	bufmgr_fake->last_dispatch = (volatile int *)last_dispatch;
 }
 
-drm_intel_bufmgr *
+drm_public drm_intel_bufmgr *
 drm_intel_bufmgr_fake_init(int fd, unsigned long low_offset,
 			   void *low_virtual, unsigned long size,
 			   volatile unsigned int *last_dispatch)

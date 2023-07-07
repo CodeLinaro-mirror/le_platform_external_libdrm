@@ -34,10 +34,6 @@
 #ifndef LIBDRM_ATOMICS_H
 #define LIBDRM_ATOMICS_H
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #if HAVE_LIBDRM_ATOMIC_PRIMITIVES
 
 #define HAS_ATOMIC_OPS 1
@@ -58,6 +54,7 @@ typedef struct {
 #endif
 
 #if HAVE_LIB_ATOMIC_OPS
+#define AO_REQUIRE_CAS
 #include <atomic_ops.h>
 
 #define HAS_ATOMIC_OPS 1
@@ -101,7 +98,7 @@ typedef struct { LIBDRM_ATOMIC_TYPE atomic; } atomic_t;
 
 #endif
 
-#if ! HAS_ATOMIC_OPS
+#if !defined(HAS_ATOMIC_OPS)
 #error libdrm requires atomic operations, please define them for your CPU/compiler.
 #endif
 

@@ -53,7 +53,7 @@ static const uint32_t vce_create[] = {
 	0x000000a0,
 	0x000000a0,
 	0x00000010,
-	0x00000000,
+	0x00000201,
 };
 
 static const uint32_t vce_rate_ctrl[] = {
@@ -314,5 +314,22 @@ static uint32_t vce_encode[88] = {
 static const uint32_t vce_destroy[] = {
 	0x00000008,
 	0x02000001,
+};
+
+static const uint32_t vce_mv_buffer[] = {
+	0x00000038,
+	0x0500000d,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
+	0x00000000,
 };
 #endif /*_vce_ib_h*/

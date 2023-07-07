@@ -26,12 +26,9 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#ifdef HAVE_CONFIG_H
-# include <config.h>
-#endif
-
 #include <assert.h>
 
+#include "xf86atomic.h"
 #include "freedreno_ringbuffer.h"
 #include "kgsl_priv.h"
 
@@ -113,7 +110,8 @@ static void * kgsl_ringbuffer_hostptr(struct fd_ringbuffer *ring)
 	return kgsl_ring->bo->hostptr;
 }
 
-static int kgsl_ringbuffer_flush(struct fd_ringbuffer *ring, uint32_t *last_start)
+static int kgsl_ringbuffer_flush(struct fd_ringbuffer *ring, uint32_t *last_start,
+		int in_fence_fd, int *out_fence_fd)
 {
 	struct kgsl_ringbuffer *kgsl_ring = to_kgsl_ringbuffer(ring);
 	struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(ring->pipe);
@@ -131,6 +129,9 @@ static int kgsl_ringbuffer_flush(struct fd_ringbuffer *ring, uint32_t *last_star
 	};
 	int ret;
 
+	assert(in_fence_fd == -1);
+	assert(out_fence_fd == NULL);
+
 	kgsl_pipe_pre_submit(kgsl_pipe);
 
 	/* z180_cmdstream_issueibcmds() is made of fail: */
@@ -142,7 +143,7 @@ static int kgsl_ringbuffer_flush(struct fd_ringbuffer *ring, uint32_t *last_star
 		ibdesc.gpuaddr = kgsl_ring->bo->gpuaddr;
 		ibdesc.hostptr = kgsl_ring->bo->hostptr;
 		ibdesc.sizedwords = 0x145;
-		req.timestamp = (uint32_t)kgsl_ring->bo->hostptr;
+		req.timestamp = (uintptr_t)kgsl_ring->bo->hostptr;
 	}
 
 	do {
@@ -173,12 +174,13 @@ static void kgsl_ringbuffer_emit_reloc(struct fd_ringbuffer *ring,
 	kgsl_pipe_add_submit(to_kgsl_pipe(ring->pipe), kgsl_bo);
 }
 
-static void kgsl_ringbuffer_emit_reloc_ring(struct fd_ringbuffer *ring,
-		struct fd_ringmarker *target, struct fd_ringmarker *end)
+static uint32_t kgsl_ringbuffer_emit_reloc_ring(struct fd_ringbuffer *ring,
+		struct fd_ringbuffer *target, uint32_t cmd_idx)
 {
-	struct kgsl_ringbuffer *target_ring = to_kgsl_ringbuffer(target->ring);
-	(*ring->cur++) = target_ring->bo->gpuaddr +
-			(uint8_t *)target->cur - (uint8_t *)target->ring->start;
+	struct kgsl_ringbuffer *target_ring = to_kgsl_ringbuffer(target);
+	assert(cmd_idx == 0);
+	(*ring->cur++) = target_ring->bo->gpuaddr;
+	return 	offset_bytes(target->cur, target->start);
 }
 
 static void kgsl_ringbuffer_destroy(struct fd_ringbuffer *ring)
@@ -200,10 +202,12 @@ static const struct fd_ringbuffer_funcs funcs = {
 };
 
 drm_private struct fd_ringbuffer * kgsl_ringbuffer_new(struct fd_pipe *pipe,
-		uint32_t size)
+		uint32_t size, enum fd_ringbuffer_flags flags)
 {
 	struct kgsl_ringbuffer *kgsl_ring;
 	struct fd_ringbuffer *ring = NULL;
+
+	assert(!flags);
 
 	kgsl_ring = calloc(1, sizeof(*kgsl_ring));
 	if (!kgsl_ring) {
@@ -212,7 +216,10 @@ drm_private struct fd_ringbuffer * kgsl_ringbuffer_new(struct fd_pipe *pipe,
 	}
 
 	ring = &kgsl_ring->base;
+	atomic_set(&ring->refcnt, 1);
+
 	ring->funcs = &funcs;
+	ring->size = size;
 
 	kgsl_ring->bo = kgsl_rb_bo_new(to_kgsl_pipe(pipe), size);
 	if (!kgsl_ring->bo) {

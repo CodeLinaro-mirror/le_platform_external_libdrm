@@ -34,10 +34,6 @@
  *	    Dave Airlie <airlied@linux.ie>
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <xf86drm.h>
 #include <xf86atomic.h>
 #include <fcntl.h>
@@ -64,8 +60,9 @@
 #include "string.h"
 
 #include "i915_drm.h"
+#include "uthash.h"
 
-#ifdef HAVE_VALGRIND
+#if HAVE_VALGRIND
 #include <valgrind.h>
 #include <memcheck.h>
 #define VG(x) x
@@ -117,7 +114,6 @@ typedef struct _drm_intel_bufmgr_gem {
 
 	pthread_mutex_t lock;
 
-	struct drm_i915_gem_exec_object *exec_objects;
 	struct drm_i915_gem_exec_object2 *exec2_objects;
 	drm_intel_bo **exec_bos;
 	int exec_size;
@@ -130,7 +126,9 @@ typedef struct _drm_intel_bufmgr_gem {
 
 	drmMMListHead managers;
 
-	drmMMListHead named;
+	drm_intel_bo_gem *name_table;
+	drm_intel_bo_gem *handle_table;
+
 	drmMMListHead vma_cache;
 	int vma_count, vma_open, vma_max;
 
@@ -146,6 +144,7 @@ typedef struct _drm_intel_bufmgr_gem {
 	unsigned int bo_reuse : 1;
 	unsigned int no_exec : 1;
 	unsigned int has_vebox : 1;
+	unsigned int has_exec_async : 1;
 	bool fenced_relocs;
 
 	struct {
@@ -175,7 +174,9 @@ struct _drm_intel_bo_gem {
          * List contains both flink named and prime fd'd objects
 	 */
 	unsigned int global_name;
-	drmMMListHead name_list;
+
+	UT_hash_handle handle_hh;
+	UT_hash_handle name_hh;
 
 	/**
 	 * Index of the buffer within the validation list while preparing a
@@ -189,6 +190,8 @@ struct _drm_intel_bo_gem {
 	uint32_t tiling_mode;
 	uint32_t swizzle_mode;
 	unsigned long stride;
+
+	unsigned long kflags;
 
 	time_t free_time;
 
@@ -211,6 +214,8 @@ struct _drm_intel_bo_gem {
 	void *mem_virtual;
 	/** GTT virtual address for the buffer, saved across map/unmap cycles */
 	void *gtt_virtual;
+	/** WC CPU address for the buffer, saved across map/unmap cycles */
+	void *wc_virtual;
 	/**
 	 * Virtual address of the buffer allocated by user, used for userptr
 	 * objects only.
@@ -249,7 +254,7 @@ struct _drm_intel_bo_gem {
 	 * Boolean of whether the GPU is definitely not accessing the buffer.
 	 *
 	 * This is only valid when reusable, since non-reusable
-	 * buffers are those that have been shared wth other
+	 * buffers are those that have been shared with other
 	 * processes, so we don't know their state.
 	 */
 	bool idle;
@@ -258,20 +263,6 @@ struct _drm_intel_bo_gem {
 	 * Boolean of whether this buffer was allocated with userptr
 	 */
 	bool is_userptr;
-
-	/**
-	 * Boolean of whether this buffer can be placed in the full 48-bit
-	 * address range on gen8+.
-	 *
-	 * By default, buffers will be keep in a 32-bit range, unless this
-	 * flag is explicitly set.
-	 */
-	bool use_48b_address_range;
-
-	/**
-	 * Whether this buffer is softpinned at offset specified by the user
-	 */
-	bool is_softpin;
 
 	/**
 	 * Size in bytes of this buffer and its relocation descendents.
@@ -287,7 +278,7 @@ struct _drm_intel_bo_gem {
 	 */
 	int reloc_tree_fences;
 
-	/** Flags that we may need to do the SW_FINSIH ioctl on unmap. */
+	/** Flags that we may need to do the SW_FINISH ioctl on unmap. */
 	bool mapped_cpu_write;
 };
 
@@ -428,7 +419,7 @@ drm_intel_gem_dump_validation_list(drm_intel_bufmgr_gem *bufmgr_gem)
 
 		if (bo_gem->relocs == NULL && bo_gem->softpin_target == NULL) {
 			DBG("%2d: %d %s(%s)\n", i, bo_gem->gem_handle,
-			    bo_gem->is_softpin ? "*" : "",
+			    bo_gem->kflags & EXEC_OBJECT_PINNED ? "*" : "",
 			    bo_gem->name);
 			continue;
 		}
@@ -442,7 +433,7 @@ drm_intel_gem_dump_validation_list(drm_intel_bufmgr_gem *bufmgr_gem)
 			    "%d (%s)@0x%08x %08x + 0x%08x\n",
 			    i,
 			    bo_gem->gem_handle,
-			    bo_gem->is_softpin ? "*" : "",
+			    bo_gem->kflags & EXEC_OBJECT_PINNED ? "*" : "",
 			    bo_gem->name,
 			    upper_32_bits(bo_gem->relocs[j].offset),
 			    lower_32_bits(bo_gem->relocs[j].offset),
@@ -461,7 +452,7 @@ drm_intel_gem_dump_validation_list(drm_intel_bufmgr_gem *bufmgr_gem)
 			    "%d *(%s)@0x%08x %08x\n",
 			    i,
 			    bo_gem->gem_handle,
-			    bo_gem->is_softpin ? "*" : "",
+			    bo_gem->kflags & EXEC_OBJECT_PINNED ? "*" : "",
 			    bo_gem->name,
 			    target_gem->gem_handle,
 			    target_gem->name,
@@ -488,57 +479,16 @@ drm_intel_gem_bo_reference(drm_intel_bo *bo)
  * access flags.
  */
 static void
-drm_intel_add_validate_buffer(drm_intel_bo *bo)
-{
-	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
-	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-	int index;
-
-	if (bo_gem->validate_index != -1)
-		return;
-
-	/* Extend the array of validation entries as necessary. */
-	if (bufmgr_gem->exec_count == bufmgr_gem->exec_size) {
-		int new_size = bufmgr_gem->exec_size * 2;
-
-		if (new_size == 0)
-			new_size = 5;
-
-		bufmgr_gem->exec_objects =
-		    realloc(bufmgr_gem->exec_objects,
-			    sizeof(*bufmgr_gem->exec_objects) * new_size);
-		bufmgr_gem->exec_bos =
-		    realloc(bufmgr_gem->exec_bos,
-			    sizeof(*bufmgr_gem->exec_bos) * new_size);
-		bufmgr_gem->exec_size = new_size;
-	}
-
-	index = bufmgr_gem->exec_count;
-	bo_gem->validate_index = index;
-	/* Fill in array entry */
-	bufmgr_gem->exec_objects[index].handle = bo_gem->gem_handle;
-	bufmgr_gem->exec_objects[index].relocation_count = bo_gem->reloc_count;
-	bufmgr_gem->exec_objects[index].relocs_ptr = (uintptr_t) bo_gem->relocs;
-	bufmgr_gem->exec_objects[index].alignment = bo->align;
-	bufmgr_gem->exec_objects[index].offset = 0;
-	bufmgr_gem->exec_bos[index] = bo;
-	bufmgr_gem->exec_count++;
-}
-
-static void
 drm_intel_add_validate_buffer2(drm_intel_bo *bo, int need_fence)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bo->bufmgr;
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *)bo;
 	int index;
-	int flags = 0;
+	unsigned long flags;
 
+	flags = 0;
 	if (need_fence)
 		flags |= EXEC_OBJECT_NEEDS_FENCE;
-	if (bo_gem->use_48b_address_range)
-		flags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
-	if (bo_gem->is_softpin)
-		flags |= EXEC_OBJECT_PINNED;
 
 	if (bo_gem->validate_index != -1) {
 		bufmgr_gem->exec2_objects[bo_gem->validate_index].flags |= flags;
@@ -568,12 +518,11 @@ drm_intel_add_validate_buffer2(drm_intel_bo *bo, int need_fence)
 	bufmgr_gem->exec2_objects[index].relocation_count = bo_gem->reloc_count;
 	bufmgr_gem->exec2_objects[index].relocs_ptr = (uintptr_t)bo_gem->relocs;
 	bufmgr_gem->exec2_objects[index].alignment = bo->align;
-	bufmgr_gem->exec2_objects[index].offset = bo_gem->is_softpin ?
-		bo->offset64 : 0;
-	bufmgr_gem->exec_bos[index] = bo;
-	bufmgr_gem->exec2_objects[index].flags = flags;
+	bufmgr_gem->exec2_objects[index].offset = bo->offset64;
+	bufmgr_gem->exec2_objects[index].flags = bo_gem->kflags | flags;
 	bufmgr_gem->exec2_objects[index].rsvd1 = 0;
 	bufmgr_gem->exec2_objects[index].rsvd2 = 0;
+	bufmgr_gem->exec_bos[index] = bo;
 	bufmgr_gem->exec_count++;
 }
 
@@ -667,7 +616,6 @@ drm_intel_gem_bo_busy(drm_intel_bo *bo)
 	} else {
 		return false;
 	}
-	return (ret == 0 && busy.busy);
 }
 
 static int
@@ -797,14 +745,17 @@ retry:
 			}
 		}
 	}
-	pthread_mutex_unlock(&bufmgr_gem->lock);
 
 	if (!alloc_from_cache) {
 		struct drm_i915_gem_create create;
 
 		bo_gem = calloc(1, sizeof(*bo_gem));
 		if (!bo_gem)
-			return NULL;
+			goto err;
+
+		/* drm_intel_gem_bo_free calls DRMLISTDEL() for an uninitialized
+		   list (vma_list), so better set the list head here */
+		DRMINITLISTHEAD(&bo_gem->vma_list);
 
 		bo_gem->bo.size = bo_size;
 
@@ -814,12 +765,17 @@ retry:
 		ret = drmIoctl(bufmgr_gem->fd,
 			       DRM_IOCTL_I915_GEM_CREATE,
 			       &create);
-		bo_gem->gem_handle = create.handle;
-		bo_gem->bo.handle = bo_gem->gem_handle;
 		if (ret != 0) {
 			free(bo_gem);
-			return NULL;
+			goto err;
 		}
+
+		bo_gem->gem_handle = create.handle;
+		HASH_ADD(handle_hh, bufmgr_gem->handle_table,
+			 gem_handle, sizeof(bo_gem->gem_handle),
+			 bo_gem);
+
+		bo_gem->bo.handle = bo_gem->gem_handle;
 		bo_gem->bo.bufmgr = bufmgr;
 		bo_gem->bo.align = alignment;
 
@@ -827,16 +783,10 @@ retry:
 		bo_gem->swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
 		bo_gem->stride = 0;
 
-		/* drm_intel_gem_bo_free calls DRMLISTDEL() for an uninitialized
-		   list (vma_list), so better set the list head here */
-		DRMINITLISTHEAD(&bo_gem->name_list);
-		DRMINITLISTHEAD(&bo_gem->vma_list);
 		if (drm_intel_gem_bo_set_tiling_internal(&bo_gem->bo,
 							 tiling_mode,
-							 stride)) {
-		    drm_intel_gem_bo_free(&bo_gem->bo);
-		    return NULL;
-		}
+							 stride))
+			goto err_free;
 	}
 
 	bo_gem->name = name;
@@ -846,14 +796,20 @@ retry:
 	bo_gem->used_as_reloc_target = false;
 	bo_gem->has_error = false;
 	bo_gem->reusable = true;
-	bo_gem->use_48b_address_range = false;
 
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, alignment);
+	pthread_mutex_unlock(&bufmgr_gem->lock);
 
 	DBG("bo_create: buf %d (%s) %ldb\n",
 	    bo_gem->gem_handle, bo_gem->name, size);
 
 	return &bo_gem->bo;
+
+err_free:
+	drm_intel_gem_bo_free(&bo_gem->bo);
+err:
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+	return NULL;
 }
 
 static drm_intel_bo *
@@ -954,6 +910,9 @@ drm_intel_gem_bo_alloc_userptr(drm_intel_bufmgr *bufmgr,
 	if (!bo_gem)
 		return NULL;
 
+	atomic_set(&bo_gem->refcount, 1);
+	DRMINITLISTHEAD(&bo_gem->vma_list);
+
 	bo_gem->bo.size = size;
 
 	memclear(userptr);
@@ -972,6 +931,8 @@ drm_intel_gem_bo_alloc_userptr(drm_intel_bufmgr *bufmgr,
 		return NULL;
 	}
 
+	pthread_mutex_lock(&bufmgr_gem->lock);
+
 	bo_gem->gem_handle = userptr.handle;
 	bo_gem->bo.handle = bo_gem->gem_handle;
 	bo_gem->bo.bufmgr    = bufmgr;
@@ -983,19 +944,19 @@ drm_intel_gem_bo_alloc_userptr(drm_intel_bufmgr *bufmgr,
 	bo_gem->swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
 	bo_gem->stride       = 0;
 
-	DRMINITLISTHEAD(&bo_gem->name_list);
-	DRMINITLISTHEAD(&bo_gem->vma_list);
+	HASH_ADD(handle_hh, bufmgr_gem->handle_table,
+		 gem_handle, sizeof(bo_gem->gem_handle),
+		 bo_gem);
 
 	bo_gem->name = name;
-	atomic_set(&bo_gem->refcount, 1);
 	bo_gem->validate_index = -1;
 	bo_gem->reloc_tree_fences = 0;
 	bo_gem->used_as_reloc_target = false;
 	bo_gem->has_error = false;
 	bo_gem->reusable = false;
-	bo_gem->use_48b_address_range = false;
 
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
+	pthread_mutex_unlock(&bufmgr_gem->lock);
 
 	DBG("bo_create_userptr: "
 	    "ptr %p buf %d (%s) size %ldb, stride 0x%x, tile mode %d\n",
@@ -1069,13 +1030,35 @@ check_bo_alloc_userptr(drm_intel_bufmgr *bufmgr,
 					  tiling_mode, stride, size, flags);
 }
 
+static int get_tiling_mode(drm_intel_bufmgr_gem *bufmgr_gem,
+			   uint32_t gem_handle,
+			   uint32_t *tiling_mode,
+			   uint32_t *swizzle_mode)
+{
+	struct drm_i915_gem_get_tiling get_tiling = {
+		.handle = gem_handle,
+	};
+	int ret;
+
+	ret = drmIoctl(bufmgr_gem->fd,
+		       DRM_IOCTL_I915_GEM_GET_TILING,
+		       &get_tiling);
+	if (ret != 0 && errno != EOPNOTSUPP)
+		return ret;
+
+	*tiling_mode = get_tiling.tiling_mode;
+	*swizzle_mode = get_tiling.swizzle_mode;
+
+	return 0;
+}
+
 /**
  * Returns a drm_intel_bo wrapping the given buffer object handle.
  *
  * This can be used when one application needs to pass a buffer object
  * to another.
  */
-drm_intel_bo *
+drm_public drm_intel_bo *
 drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 				  const char *name,
 				  unsigned int handle)
@@ -1084,8 +1067,6 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	drm_intel_bo_gem *bo_gem;
 	int ret;
 	struct drm_gem_open open_arg;
-	struct drm_i915_gem_get_tiling get_tiling;
-	drmMMListHead *list;
 
 	/* At the moment most applications only have a few named bo.
 	 * For instance, in a DRI client only the render buffers passed
@@ -1094,15 +1075,11 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	 * provides a sufficiently fast match.
 	 */
 	pthread_mutex_lock(&bufmgr_gem->lock);
-	for (list = bufmgr_gem->named.next;
-	     list != &bufmgr_gem->named;
-	     list = list->next) {
-		bo_gem = DRMLISTENTRY(drm_intel_bo_gem, list, name_list);
-		if (bo_gem->global_name == handle) {
-			drm_intel_gem_bo_reference(&bo_gem->bo);
-			pthread_mutex_unlock(&bufmgr_gem->lock);
-			return &bo_gem->bo;
-		}
+	HASH_FIND(name_hh, bufmgr_gem->name_table,
+		  &handle, sizeof(handle), bo_gem);
+	if (bo_gem) {
+		drm_intel_gem_bo_reference(&bo_gem->bo);
+		goto out;
 	}
 
 	memclear(open_arg);
@@ -1113,29 +1090,26 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	if (ret != 0) {
 		DBG("Couldn't reference %s handle 0x%08x: %s\n",
 		    name, handle, strerror(errno));
-		pthread_mutex_unlock(&bufmgr_gem->lock);
-		return NULL;
+		bo_gem = NULL;
+		goto out;
 	}
         /* Now see if someone has used a prime handle to get this
          * object from the kernel before by looking through the list
          * again for a matching gem_handle
          */
-	for (list = bufmgr_gem->named.next;
-	     list != &bufmgr_gem->named;
-	     list = list->next) {
-		bo_gem = DRMLISTENTRY(drm_intel_bo_gem, list, name_list);
-		if (bo_gem->gem_handle == open_arg.handle) {
-			drm_intel_gem_bo_reference(&bo_gem->bo);
-			pthread_mutex_unlock(&bufmgr_gem->lock);
-			return &bo_gem->bo;
-		}
+	HASH_FIND(handle_hh, bufmgr_gem->handle_table,
+		  &open_arg.handle, sizeof(open_arg.handle), bo_gem);
+	if (bo_gem) {
+		drm_intel_gem_bo_reference(&bo_gem->bo);
+		goto out;
 	}
 
 	bo_gem = calloc(1, sizeof(*bo_gem));
-	if (!bo_gem) {
-		pthread_mutex_unlock(&bufmgr_gem->lock);
-		return NULL;
-	}
+	if (!bo_gem)
+		goto out;
+
+	atomic_set(&bo_gem->refcount, 1);
+	DRMINITLISTHEAD(&bo_gem->vma_list);
 
 	bo_gem->bo.size = open_arg.size;
 	bo_gem->bo.offset = 0;
@@ -1143,35 +1117,34 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	bo_gem->bo.virtual = NULL;
 	bo_gem->bo.bufmgr = bufmgr;
 	bo_gem->name = name;
-	atomic_set(&bo_gem->refcount, 1);
 	bo_gem->validate_index = -1;
 	bo_gem->gem_handle = open_arg.handle;
 	bo_gem->bo.handle = open_arg.handle;
 	bo_gem->global_name = handle;
 	bo_gem->reusable = false;
-	bo_gem->use_48b_address_range = false;
 
-	memclear(get_tiling);
-	get_tiling.handle = bo_gem->gem_handle;
-	ret = drmIoctl(bufmgr_gem->fd,
-		       DRM_IOCTL_I915_GEM_GET_TILING,
-		       &get_tiling);
-	if (ret != 0) {
-		drm_intel_gem_bo_unreference(&bo_gem->bo);
-		pthread_mutex_unlock(&bufmgr_gem->lock);
-		return NULL;
-	}
-	bo_gem->tiling_mode = get_tiling.tiling_mode;
-	bo_gem->swizzle_mode = get_tiling.swizzle_mode;
+	HASH_ADD(handle_hh, bufmgr_gem->handle_table,
+		 gem_handle, sizeof(bo_gem->gem_handle), bo_gem);
+	HASH_ADD(name_hh, bufmgr_gem->name_table,
+		 global_name, sizeof(bo_gem->global_name), bo_gem);
+
+	ret = get_tiling_mode(bufmgr_gem, bo_gem->gem_handle,
+			      &bo_gem->tiling_mode, &bo_gem->swizzle_mode);
+	if (ret != 0)
+		goto err_unref;
+
 	/* XXX stride is unknown */
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
-
-	DRMINITLISTHEAD(&bo_gem->vma_list);
-	DRMLISTADDTAIL(&bo_gem->name_list, &bufmgr_gem->named);
-	pthread_mutex_unlock(&bufmgr_gem->lock);
 	DBG("bo_create_from_handle: %d (%s)\n", handle, bo_gem->name);
 
+out:
+	pthread_mutex_unlock(&bufmgr_gem->lock);
 	return &bo_gem->bo;
+
+err_unref:
+	drm_intel_gem_bo_free(&bo_gem->bo);
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+	return NULL;
 }
 
 static void
@@ -1179,7 +1152,6 @@ drm_intel_gem_bo_free(drm_intel_bo *bo)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-	struct drm_gem_close close;
 	int ret;
 
 	DRMLISTDEL(&bo_gem->vma_list);
@@ -1188,17 +1160,24 @@ drm_intel_gem_bo_free(drm_intel_bo *bo)
 		drm_munmap(bo_gem->mem_virtual, bo_gem->bo.size);
 		bufmgr_gem->vma_count--;
 	}
+	if (bo_gem->wc_virtual) {
+		VG(VALGRIND_FREELIKE_BLOCK(bo_gem->wc_virtual, 0));
+		drm_munmap(bo_gem->wc_virtual, bo_gem->bo.size);
+		bufmgr_gem->vma_count--;
+	}
 	if (bo_gem->gtt_virtual) {
 		drm_munmap(bo_gem->gtt_virtual, bo_gem->bo.size);
 		bufmgr_gem->vma_count--;
 	}
 
+	if (bo_gem->global_name)
+		HASH_DELETE(name_hh, bufmgr_gem->name_table, bo_gem);
+	HASH_DELETE(handle_hh, bufmgr_gem->handle_table, bo_gem);
+
 	/* Close this object */
-	memclear(close);
-	close.handle = bo_gem->gem_handle;
-	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_GEM_CLOSE, &close);
+	ret = drmCloseBufferHandle(bufmgr_gem->fd, bo_gem->gem_handle);
 	if (ret != 0) {
-		DBG("DRM_IOCTL_GEM_CLOSE %d failed (%s): %s\n",
+		DBG("drmCloseBufferHandle %d failed (%s): %s\n",
 		    bo_gem->gem_handle, bo_gem->name, strerror(errno));
 	}
 	free(bo);
@@ -1212,6 +1191,9 @@ drm_intel_gem_bo_mark_mmaps_incoherent(drm_intel_bo *bo)
 
 	if (bo_gem->mem_virtual)
 		VALGRIND_MAKE_MEM_NOACCESS(bo_gem->mem_virtual, bo->size);
+
+	if (bo_gem->wc_virtual)
+		VALGRIND_MAKE_MEM_NOACCESS(bo_gem->wc_virtual, bo->size);
 
 	if (bo_gem->gtt_virtual)
 		VALGRIND_MAKE_MEM_NOACCESS(bo_gem->gtt_virtual, bo->size);
@@ -1277,6 +1259,11 @@ static void drm_intel_gem_bo_purge_vma_cache(drm_intel_bufmgr_gem *bufmgr_gem)
 			bo_gem->mem_virtual = NULL;
 			bufmgr_gem->vma_count--;
 		}
+		if (bo_gem->wc_virtual) {
+			drm_munmap(bo_gem->wc_virtual, bo_gem->bo.size);
+			bo_gem->wc_virtual = NULL;
+			bufmgr_gem->vma_count--;
+		}
 		if (bo_gem->gtt_virtual) {
 			drm_munmap(bo_gem->gtt_virtual, bo_gem->bo.size);
 			bo_gem->gtt_virtual = NULL;
@@ -1292,6 +1279,8 @@ static void drm_intel_gem_bo_close_vma(drm_intel_bufmgr_gem *bufmgr_gem,
 	DRMLISTADDTAIL(&bo_gem->vma_list, &bufmgr_gem->vma_cache);
 	if (bo_gem->mem_virtual)
 		bufmgr_gem->vma_count++;
+	if (bo_gem->wc_virtual)
+		bufmgr_gem->vma_count++;
 	if (bo_gem->gtt_virtual)
 		bufmgr_gem->vma_count++;
 	drm_intel_gem_bo_purge_vma_cache(bufmgr_gem);
@@ -1303,6 +1292,8 @@ static void drm_intel_gem_bo_open_vma(drm_intel_bufmgr_gem *bufmgr_gem,
 	bufmgr_gem->vma_open++;
 	DRMLISTDEL(&bo_gem->vma_list);
 	if (bo_gem->mem_virtual)
+		bufmgr_gem->vma_count--;
+	if (bo_gem->wc_virtual)
 		bufmgr_gem->vma_count--;
 	if (bo_gem->gtt_virtual)
 		bufmgr_gem->vma_count--;
@@ -1328,6 +1319,7 @@ drm_intel_gem_bo_unreference_final(drm_intel_bo *bo, time_t time)
 	for (i = 0; i < bo_gem->softpin_target_count; i++)
 		drm_intel_gem_bo_unreference_locked_timed(bo_gem->softpin_target[i],
 								  time);
+	bo_gem->kflags = 0;
 	bo_gem->reloc_count = 0;
 	bo_gem->used_as_reloc_target = false;
 	bo_gem->softpin_target_count = 0;
@@ -1357,8 +1349,6 @@ drm_intel_gem_bo_unreference_final(drm_intel_bo *bo, time_t time)
 		drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
 		drm_intel_gem_bo_mark_mmaps_incoherent(bo);
 	}
-
-	DRMLISTDEL(&bo_gem->name_list);
 
 	bucket = drm_intel_gem_bo_bucket_for_size(bufmgr_gem, bo->size);
 	/* Put the buffer into our internal cache for reuse if we can. */
@@ -1546,7 +1536,7 @@ map_gtt(drm_intel_bo *bo)
 	return 0;
 }
 
-int
+drm_public int
 drm_intel_gem_bo_map_gtt(drm_intel_bo *bo)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
@@ -1605,11 +1595,11 @@ drm_intel_gem_bo_map_gtt(drm_intel_bo *bo)
  * undefined).
  */
 
-int
+drm_public int
 drm_intel_gem_bo_map_unsynchronized(drm_intel_bo *bo)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
-#ifdef HAVE_VALGRIND
+#if HAVE_VALGRIND
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
 #endif
 	int ret;
@@ -1681,7 +1671,7 @@ static int drm_intel_gem_bo_unmap(drm_intel_bo *bo)
 	}
 
 	/* We need to unmap after every innovation as we cannot track
-	 * an open vma for every bo as that will exhaasut the system
+	 * an open vma for every bo as that will exhaust the system
 	 * limits and cause later failures.
 	 */
 	if (--bo_gem->map_count == 0) {
@@ -1694,10 +1684,86 @@ static int drm_intel_gem_bo_unmap(drm_intel_bo *bo)
 	return ret;
 }
 
-int
+drm_public int
 drm_intel_gem_bo_unmap_gtt(drm_intel_bo *bo)
 {
 	return drm_intel_gem_bo_unmap(bo);
+}
+
+static bool is_cache_coherent(drm_intel_bo *bo)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+	struct drm_i915_gem_caching arg = {};
+
+	arg.handle = bo_gem->gem_handle;
+	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_GET_CACHING, &arg))
+		assert(false);
+	return arg.caching != I915_CACHING_NONE;
+}
+
+static void set_domain(drm_intel_bo *bo, uint32_t read, uint32_t write)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+	struct drm_i915_gem_set_domain arg = {};
+
+	arg.handle = bo_gem->gem_handle;
+	arg.read_domains = read;
+	arg.write_domain = write;
+	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &arg))
+		assert(false);
+}
+
+static int mmap_write(drm_intel_bo *bo, unsigned long offset,
+		      unsigned long length, const void *buf)
+{
+	void *map = NULL;
+
+	if (!length)
+		return 0;
+
+	if (is_cache_coherent(bo)) {
+		map = drm_intel_gem_bo_map__cpu(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_CPU, I915_GEM_DOMAIN_CPU);
+	}
+	if (!map) {
+		map = drm_intel_gem_bo_map__wc(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_WC, I915_GEM_DOMAIN_WC);
+	}
+
+	assert(map);
+	memcpy((char *)map + offset, buf, length);
+	drm_intel_gem_bo_unmap(bo);
+	return 0;
+}
+
+static int mmap_read(drm_intel_bo *bo, unsigned long offset,
+		      unsigned long length, void *buf)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	void *map = NULL;
+
+	if (!length)
+		return 0;
+
+	if (bufmgr_gem->has_llc || is_cache_coherent(bo)) {
+		map = drm_intel_gem_bo_map__cpu(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_CPU, 0);
+	}
+	if (!map) {
+		map = drm_intel_gem_bo_map__wc(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_WC, 0);
+	}
+
+	assert(map);
+	memcpy(buf, (char *)map + offset, length);
+	drm_intel_gem_bo_unmap(bo);
+	return 0;
 }
 
 static int
@@ -1720,14 +1786,20 @@ drm_intel_gem_bo_subdata(drm_intel_bo *bo, unsigned long offset,
 	ret = drmIoctl(bufmgr_gem->fd,
 		       DRM_IOCTL_I915_GEM_PWRITE,
 		       &pwrite);
-	if (ret != 0) {
+	if (ret)
 		ret = -errno;
+
+	if (ret != 0 && ret != -EOPNOTSUPP) {
 		DBG("%s:%d: Error writing data to buffer %d: (%d %d) %s .\n",
 		    __FILE__, __LINE__, bo_gem->gem_handle, (int)offset,
 		    (int)size, strerror(errno));
+		return ret;
 	}
 
-	return ret;
+	if (ret == -EOPNOTSUPP)
+		mmap_write(bo, offset, size, data);
+
+	return 0;
 }
 
 static int
@@ -1775,14 +1847,20 @@ drm_intel_gem_bo_get_subdata(drm_intel_bo *bo, unsigned long offset,
 	ret = drmIoctl(bufmgr_gem->fd,
 		       DRM_IOCTL_I915_GEM_PREAD,
 		       &pread);
-	if (ret != 0) {
+	if (ret)
 		ret = -errno;
+
+	if (ret != 0 && ret != -EOPNOTSUPP) {
 		DBG("%s:%d: Error reading data from buffer %d: (%d %d) %s .\n",
 		    __FILE__, __LINE__, bo_gem->gem_handle, (int)offset,
 		    (int)size, strerror(errno));
+		return ret;
 	}
 
-	return ret;
+	if (ret == -EOPNOTSUPP)
+		mmap_read(bo, offset, size, data);
+
+	return 0;
 }
 
 /** Waits for all GPU rendering with the object to have completed. */
@@ -1819,7 +1897,7 @@ drm_intel_gem_bo_wait_rendering(drm_intel_bo *bo)
  * Note that some kernels have broken the inifite wait for negative values
  * promise, upgrade to latest stable kernels if this is the case.
  */
-int
+drm_public int
 drm_intel_gem_bo_wait(drm_intel_bo *bo, int64_t timeout_ns)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
@@ -1855,7 +1933,7 @@ drm_intel_gem_bo_wait(drm_intel_bo *bo, int64_t timeout_ns)
  * In combination with drm_intel_gem_bo_pin() and manual fence management, we
  * can do tiled pixmaps this way.
  */
-void
+drm_public void
 drm_intel_gem_bo_start_gtt_access(drm_intel_bo *bo, int write_enable)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
@@ -1882,11 +1960,9 @@ static void
 drm_intel_bufmgr_gem_destroy(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bufmgr;
-	struct drm_gem_close close_bo;
 	int i, ret;
 
 	free(bufmgr_gem->exec2_objects);
-	free(bufmgr_gem->exec_objects);
 	free(bufmgr_gem->exec_bos);
 
 	pthread_mutex_destroy(&bufmgr_gem->lock);
@@ -1908,9 +1984,8 @@ drm_intel_bufmgr_gem_destroy(drm_intel_bufmgr *bufmgr)
 
 	/* Release userptr bo kept hanging around for optimisation. */
 	if (bufmgr_gem->userptr_active.ptr) {
-		memclear(close_bo);
-		close_bo.handle = bufmgr_gem->userptr_active.handle;
-		ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+		ret = drmCloseBufferHandle(bufmgr_gem->fd,
+					   bufmgr_gem->userptr_active.handle);
 		free(bufmgr_gem->userptr_active.ptr);
 		if (ret)
 			fprintf(stderr,
@@ -2011,7 +2086,11 @@ static void
 drm_intel_gem_bo_use_48b_address_range(drm_intel_bo *bo, uint32_t enable)
 {
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-	bo_gem->use_48b_address_range = enable;
+
+	if (enable)
+		bo_gem->kflags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	else
+		bo_gem->kflags &= ~EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
 }
 
 static int
@@ -2028,7 +2107,7 @@ drm_intel_gem_bo_add_softpin_target(drm_intel_bo *bo, drm_intel_bo *target_bo)
 		return -ENOMEM;
 	}
 
-	if (!target_bo_gem->is_softpin)
+	if (!(target_bo_gem->kflags & EXEC_OBJECT_PINNED))
 		return -EINVAL;
 	if (target_bo_gem == bo_gem)
 		return -EINVAL;
@@ -2060,7 +2139,7 @@ drm_intel_gem_bo_emit_reloc(drm_intel_bo *bo, uint32_t offset,
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bo->bufmgr;
 	drm_intel_bo_gem *target_bo_gem = (drm_intel_bo_gem *)target_bo;
 
-	if (target_bo_gem->is_softpin)
+	if (target_bo_gem->kflags & EXEC_OBJECT_PINNED)
 		return drm_intel_gem_bo_add_softpin_target(bo, target_bo);
 	else
 		return do_bo_emit_reloc(bo, offset, target_bo, target_offset,
@@ -2078,7 +2157,7 @@ drm_intel_gem_bo_emit_reloc_fence(drm_intel_bo *bo, uint32_t offset,
 				read_domains, write_domain, true);
 }
 
-int
+drm_public int
 drm_intel_gem_bo_get_reloc_count(drm_intel_bo *bo)
 {
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
@@ -2101,7 +2180,7 @@ drm_intel_gem_bo_get_reloc_count(drm_intel_bo *bo)
  *
  * This also removes all softpinned targets being referenced by the BO.
  */
-void
+drm_public void
 drm_intel_gem_bo_clear_relocs(drm_intel_bo *bo, int start)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
@@ -2142,31 +2221,6 @@ drm_intel_gem_bo_clear_relocs(drm_intel_bo *bo, int start)
  * index values into the validation list.
  */
 static void
-drm_intel_gem_bo_process_reloc(drm_intel_bo *bo)
-{
-	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-	int i;
-
-	if (bo_gem->relocs == NULL)
-		return;
-
-	for (i = 0; i < bo_gem->reloc_count; i++) {
-		drm_intel_bo *target_bo = bo_gem->reloc_target_info[i].bo;
-
-		if (target_bo == bo)
-			continue;
-
-		drm_intel_gem_bo_mark_mmaps_incoherent(bo);
-
-		/* Continue walking the tree depth-first. */
-		drm_intel_gem_bo_process_reloc(target_bo);
-
-		/* Add the target to the validate list */
-		drm_intel_add_validate_buffer(target_bo);
-	}
-}
-
-static void
 drm_intel_gem_bo_process_reloc2(drm_intel_bo *bo)
 {
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *)bo;
@@ -2206,30 +2260,6 @@ drm_intel_gem_bo_process_reloc2(drm_intel_bo *bo)
 	}
 }
 
-
-static void
-drm_intel_update_buffer_offsets(drm_intel_bufmgr_gem *bufmgr_gem)
-{
-	int i;
-
-	for (i = 0; i < bufmgr_gem->exec_count; i++) {
-		drm_intel_bo *bo = bufmgr_gem->exec_bos[i];
-		drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-
-		/* Update the buffer offset */
-		if (bufmgr_gem->exec_objects[i].offset != bo->offset64) {
-			DBG("BO %d (%s) migrated: 0x%08x %08x -> 0x%08x %08x\n",
-			    bo_gem->gem_handle, bo_gem->name,
-			    upper_32_bits(bo->offset64),
-			    lower_32_bits(bo->offset64),
-			    upper_32_bits(bufmgr_gem->exec_objects[i].offset),
-			    lower_32_bits(bufmgr_gem->exec_objects[i].offset));
-			bo->offset64 = bufmgr_gem->exec_objects[i].offset;
-			bo->offset = bufmgr_gem->exec_objects[i].offset;
-		}
-	}
-}
-
 static void
 drm_intel_update_buffer_offsets2 (drm_intel_bufmgr_gem *bufmgr_gem)
 {
@@ -2244,7 +2274,7 @@ drm_intel_update_buffer_offsets2 (drm_intel_bufmgr_gem *bufmgr_gem)
 			/* If we're seeing softpinned object here it means that the kernel
 			 * has relocated our object... Indicating a programming error
 			 */
-			assert(!bo_gem->is_softpin);
+			assert(!(bo_gem->kflags & EXEC_OBJECT_PINNED));
 			DBG("BO %d (%s) migrated: 0x%08x %08x -> 0x%08x %08x\n",
 			    bo_gem->gem_handle, bo_gem->name,
 			    upper_32_bits(bo->offset64),
@@ -2257,7 +2287,7 @@ drm_intel_update_buffer_offsets2 (drm_intel_bufmgr_gem *bufmgr_gem)
 	}
 }
 
-void
+drm_public void
 drm_intel_gem_bo_aub_dump_bmp(drm_intel_bo *bo,
 			      int x1, int y1, int width, int height,
 			      enum aub_dump_bmp_format format,
@@ -2266,75 +2296,9 @@ drm_intel_gem_bo_aub_dump_bmp(drm_intel_bo *bo,
 }
 
 static int
-drm_intel_gem_bo_exec(drm_intel_bo *bo, int used,
-		      drm_clip_rect_t * cliprects, int num_cliprects, int DR4)
-{
-	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
-	struct drm_i915_gem_execbuffer execbuf;
-	int ret, i;
-
-	if (to_bo_gem(bo)->has_error)
-		return -ENOMEM;
-
-	pthread_mutex_lock(&bufmgr_gem->lock);
-	/* Update indices and set up the validate list. */
-	drm_intel_gem_bo_process_reloc(bo);
-
-	/* Add the batch buffer to the validation list.  There are no
-	 * relocations pointing to it.
-	 */
-	drm_intel_add_validate_buffer(bo);
-
-	memclear(execbuf);
-	execbuf.buffers_ptr = (uintptr_t) bufmgr_gem->exec_objects;
-	execbuf.buffer_count = bufmgr_gem->exec_count;
-	execbuf.batch_start_offset = 0;
-	execbuf.batch_len = used;
-	execbuf.cliprects_ptr = (uintptr_t) cliprects;
-	execbuf.num_cliprects = num_cliprects;
-	execbuf.DR1 = 0;
-	execbuf.DR4 = DR4;
-
-	ret = drmIoctl(bufmgr_gem->fd,
-		       DRM_IOCTL_I915_GEM_EXECBUFFER,
-		       &execbuf);
-	if (ret != 0) {
-		ret = -errno;
-		if (errno == ENOSPC) {
-			DBG("Execbuffer fails to pin. "
-			    "Estimate: %u. Actual: %u. Available: %u\n",
-			    drm_intel_gem_estimate_batch_space(bufmgr_gem->exec_bos,
-							       bufmgr_gem->
-							       exec_count),
-			    drm_intel_gem_compute_batch_space(bufmgr_gem->exec_bos,
-							      bufmgr_gem->
-							      exec_count),
-			    (unsigned int)bufmgr_gem->gtt_size);
-		}
-	}
-	drm_intel_update_buffer_offsets(bufmgr_gem);
-
-	if (bufmgr_gem->bufmgr.debug)
-		drm_intel_gem_dump_validation_list(bufmgr_gem);
-
-	for (i = 0; i < bufmgr_gem->exec_count; i++) {
-		drm_intel_bo_gem *bo_gem = to_bo_gem(bufmgr_gem->exec_bos[i]);
-
-		bo_gem->idle = false;
-
-		/* Disconnect the buffer from the validate list */
-		bo_gem->validate_index = -1;
-		bufmgr_gem->exec_bos[i] = NULL;
-	}
-	bufmgr_gem->exec_count = 0;
-	pthread_mutex_unlock(&bufmgr_gem->lock);
-
-	return ret;
-}
-
-static int
 do_exec2(drm_intel_bo *bo, int used, drm_intel_context *ctx,
 	 drm_clip_rect_t *cliprects, int num_cliprects, int DR4,
+	 int in_fence, int *out_fence,
 	 unsigned int flags)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bo->bufmgr;
@@ -2389,12 +2353,20 @@ do_exec2(drm_intel_bo *bo, int used, drm_intel_context *ctx,
 	else
 		i915_execbuffer2_set_context_id(execbuf, ctx->ctx_id);
 	execbuf.rsvd2 = 0;
+	if (in_fence != -1) {
+		execbuf.rsvd2 = in_fence;
+		execbuf.flags |= I915_EXEC_FENCE_IN;
+	}
+	if (out_fence != NULL) {
+		*out_fence = -1;
+		execbuf.flags |= I915_EXEC_FENCE_OUT;
+	}
 
 	if (bufmgr_gem->no_exec)
 		goto skip_execution;
 
 	ret = drmIoctl(bufmgr_gem->fd,
-		       DRM_IOCTL_I915_GEM_EXECBUFFER2,
+		       DRM_IOCTL_I915_GEM_EXECBUFFER2_WR,
 		       &execbuf);
 	if (ret != 0) {
 		ret = -errno;
@@ -2409,6 +2381,9 @@ do_exec2(drm_intel_bo *bo, int used, drm_intel_context *ctx,
 		}
 	}
 	drm_intel_update_buffer_offsets2(bufmgr_gem);
+
+	if (ret == 0 && out_fence != NULL)
+		*out_fence = execbuf.rsvd2 >> 32;
 
 skip_execution:
 	if (bufmgr_gem->bufmgr.debug)
@@ -2435,7 +2410,7 @@ drm_intel_gem_bo_exec2(drm_intel_bo *bo, int used,
 		       int DR4)
 {
 	return do_exec2(bo, used, NULL, cliprects, num_cliprects, DR4,
-			I915_EXEC_RENDER);
+			-1, NULL, I915_EXEC_RENDER);
 }
 
 static int
@@ -2444,14 +2419,25 @@ drm_intel_gem_bo_mrb_exec2(drm_intel_bo *bo, int used,
 			unsigned int flags)
 {
 	return do_exec2(bo, used, NULL, cliprects, num_cliprects, DR4,
-			flags);
+			-1, NULL, flags);
 }
 
-int
+drm_public int
 drm_intel_gem_bo_context_exec(drm_intel_bo *bo, drm_intel_context *ctx,
 			      int used, unsigned int flags)
 {
-	return do_exec2(bo, used, ctx, NULL, 0, 0, flags);
+	return do_exec2(bo, used, ctx, NULL, 0, 0, -1, NULL, flags);
+}
+
+drm_public int
+drm_intel_gem_bo_fence_exec(drm_intel_bo *bo,
+			    drm_intel_context *ctx,
+			    int used,
+			    int in_fence,
+			    int *out_fence,
+			    unsigned int flags)
+{
+	return do_exec2(bo, used, ctx, NULL, 0, 0, in_fence, out_fence, flags);
 }
 
 static int
@@ -2577,21 +2563,20 @@ drm_intel_gem_bo_set_softpin_offset(drm_intel_bo *bo, uint64_t offset)
 {
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
 
-	bo_gem->is_softpin = true;
 	bo->offset64 = offset;
 	bo->offset = offset;
+	bo_gem->kflags |= EXEC_OBJECT_PINNED;
+
 	return 0;
 }
 
-drm_intel_bo *
+drm_public drm_intel_bo *
 drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int size)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bufmgr;
 	int ret;
 	uint32_t handle;
 	drm_intel_bo_gem *bo_gem;
-	struct drm_i915_gem_get_tiling get_tiling;
-	drmMMListHead *list;
 
 	pthread_mutex_lock(&bufmgr_gem->lock);
 	ret = drmPrimeFDToHandle(bufmgr_gem->fd, prime_fd, &handle);
@@ -2606,22 +2591,20 @@ drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int s
 	 * for named buffers, we must not create two bo's pointing at the same
 	 * kernel object
 	 */
-	for (list = bufmgr_gem->named.next;
-	     list != &bufmgr_gem->named;
-	     list = list->next) {
-		bo_gem = DRMLISTENTRY(drm_intel_bo_gem, list, name_list);
-		if (bo_gem->gem_handle == handle) {
-			drm_intel_gem_bo_reference(&bo_gem->bo);
-			pthread_mutex_unlock(&bufmgr_gem->lock);
-			return &bo_gem->bo;
-		}
+	HASH_FIND(handle_hh, bufmgr_gem->handle_table,
+		  &handle, sizeof(handle), bo_gem);
+	if (bo_gem) {
+		drm_intel_gem_bo_reference(&bo_gem->bo);
+		goto out;
 	}
 
 	bo_gem = calloc(1, sizeof(*bo_gem));
-	if (!bo_gem) {
-		pthread_mutex_unlock(&bufmgr_gem->lock);
-		return NULL;
-	}
+	if (!bo_gem)
+		goto out;
+
+	atomic_set(&bo_gem->refcount, 1);
+	DRMINITLISTHEAD(&bo_gem->vma_list);
+
 	/* Determine size of bo.  The fd-to-handle ioctl really should
 	 * return the size, but it doesn't.  If we have kernel 3.12 or
 	 * later, we can lseek on the prime fd to get the size.  Older
@@ -2637,8 +2620,8 @@ drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int s
 	bo_gem->bo.bufmgr = bufmgr;
 
 	bo_gem->gem_handle = handle;
-
-	atomic_set(&bo_gem->refcount, 1);
+	HASH_ADD(handle_hh, bufmgr_gem->handle_table,
+		 gem_handle, sizeof(bo_gem->gem_handle), bo_gem);
 
 	bo_gem->name = "prime";
 	bo_gem->validate_index = -1;
@@ -2646,43 +2629,33 @@ drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int s
 	bo_gem->used_as_reloc_target = false;
 	bo_gem->has_error = false;
 	bo_gem->reusable = false;
-	bo_gem->use_48b_address_range = false;
 
-	DRMINITLISTHEAD(&bo_gem->vma_list);
-	DRMLISTADDTAIL(&bo_gem->name_list, &bufmgr_gem->named);
-	pthread_mutex_unlock(&bufmgr_gem->lock);
+	ret = get_tiling_mode(bufmgr_gem, handle,
+			      &bo_gem->tiling_mode, &bo_gem->swizzle_mode);
+	if (ret)
+		goto err;
 
-	memclear(get_tiling);
-	get_tiling.handle = bo_gem->gem_handle;
-	ret = drmIoctl(bufmgr_gem->fd,
-		       DRM_IOCTL_I915_GEM_GET_TILING,
-		       &get_tiling);
-	if (ret != 0) {
-		DBG("create_from_prime: failed to get tiling: %s\n", strerror(errno));
-		drm_intel_gem_bo_unreference(&bo_gem->bo);
-		return NULL;
-	}
-	bo_gem->tiling_mode = get_tiling.tiling_mode;
-	bo_gem->swizzle_mode = get_tiling.swizzle_mode;
 	/* XXX stride is unknown */
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
 
+out:
+	pthread_mutex_unlock(&bufmgr_gem->lock);
 	return &bo_gem->bo;
+
+err:
+	drm_intel_gem_bo_free(&bo_gem->bo);
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+	return NULL;
 }
 
-int
+drm_public int
 drm_intel_bo_gem_export_to_prime(drm_intel_bo *bo, int *prime_fd)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
 
-	pthread_mutex_lock(&bufmgr_gem->lock);
-        if (DRMLISTEMPTY(&bo_gem->name_list))
-                DRMLISTADDTAIL(&bo_gem->name_list, &bufmgr_gem->named);
-	pthread_mutex_unlock(&bufmgr_gem->lock);
-
 	if (drmPrimeHandleToFD(bufmgr_gem->fd, bo_gem->gem_handle,
-			       DRM_CLOEXEC, prime_fd) != 0)
+			       DRM_CLOEXEC | DRM_RDWR, prime_fd) != 0)
 		return -errno;
 
 	bo_gem->reusable = false;
@@ -2695,27 +2668,24 @@ drm_intel_gem_bo_flink(drm_intel_bo *bo, uint32_t * name)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
-	int ret;
 
 	if (!bo_gem->global_name) {
 		struct drm_gem_flink flink;
 
 		memclear(flink);
 		flink.handle = bo_gem->gem_handle;
+		if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_GEM_FLINK, &flink))
+			return -errno;
 
 		pthread_mutex_lock(&bufmgr_gem->lock);
+		if (!bo_gem->global_name) {
+			bo_gem->global_name = flink.name;
+			bo_gem->reusable = false;
 
-		ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_GEM_FLINK, &flink);
-		if (ret != 0) {
-			pthread_mutex_unlock(&bufmgr_gem->lock);
-			return -errno;
+			HASH_ADD(name_hh, bufmgr_gem->name_table,
+				 global_name, sizeof(bo_gem->global_name),
+				 bo_gem);
 		}
-
-		bo_gem->global_name = flink.name;
-		bo_gem->reusable = false;
-
-                if (DRMLISTEMPTY(&bo_gem->name_list))
-                        DRMLISTADDTAIL(&bo_gem->name_list, &bufmgr_gem->named);
 		pthread_mutex_unlock(&bufmgr_gem->lock);
 	}
 
@@ -2730,12 +2700,65 @@ drm_intel_gem_bo_flink(drm_intel_bo *bo, uint32_t * name)
  * size is only bounded by how many buffers of that size we've managed to have
  * in flight at once.
  */
-void
+drm_public void
 drm_intel_bufmgr_gem_enable_reuse(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bufmgr;
 
 	bufmgr_gem->bo_reuse = true;
+}
+
+/**
+ * Disables implicit synchronisation before executing the bo
+ *
+ * This will cause rendering corruption unless you correctly manage explicit
+ * fences for all rendering involving this buffer - including use by others.
+ * Disabling the implicit serialisation is only required if that serialisation
+ * is too coarse (for example, you have split the buffer into many
+ * non-overlapping regions and are sharing the whole buffer between concurrent
+ * independent command streams).
+ *
+ * Note the kernel must advertise support via I915_PARAM_HAS_EXEC_ASYNC,
+ * which can be checked using drm_intel_bufmgr_can_disable_implicit_sync,
+ * or subsequent execbufs involving the bo will generate EINVAL.
+ */
+drm_public void
+drm_intel_gem_bo_disable_implicit_sync(drm_intel_bo *bo)
+{
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+
+	bo_gem->kflags |= EXEC_OBJECT_ASYNC;
+}
+
+/**
+ * Enables implicit synchronisation before executing the bo
+ *
+ * This is the default behaviour of the kernel, to wait upon prior writes
+ * completing on the object before rendering with it, or to wait for prior
+ * reads to complete before writing into the object.
+ * drm_intel_gem_bo_disable_implicit_sync() can stop this behaviour, telling
+ * the kernel never to insert a stall before using the object. Then this
+ * function can be used to restore the implicit sync before subsequent
+ * rendering.
+ */
+drm_public void
+drm_intel_gem_bo_enable_implicit_sync(drm_intel_bo *bo)
+{
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+
+	bo_gem->kflags &= ~EXEC_OBJECT_ASYNC;
+}
+
+/**
+ * Query whether the kernel supports disabling of its implicit synchronisation
+ * before execbuf. See drm_intel_gem_bo_disable_implicit_sync()
+ */
+drm_public int
+drm_intel_bufmgr_gem_can_disable_implicit_sync(drm_intel_bufmgr *bufmgr)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bufmgr;
+
+	return bufmgr_gem->has_exec_async;
 }
 
 /**
@@ -2745,13 +2768,11 @@ drm_intel_bufmgr_gem_enable_reuse(drm_intel_bufmgr *bufmgr)
  * allocation.  If this option is not enabled, all relocs will have fence
  * register allocated.
  */
-void
+drm_public void
 drm_intel_bufmgr_gem_enable_fenced_relocs(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bufmgr;
-
-	if (bufmgr_gem->bufmgr.bo_exec == drm_intel_gem_bo_exec2)
-		bufmgr_gem->fenced_relocs = true;
+	bufmgr_gem->fenced_relocs = true;
 }
 
 /**
@@ -3024,7 +3045,7 @@ init_cache_buckets(drm_intel_bufmgr_gem *bufmgr_gem)
 	}
 }
 
-void
+drm_public void
 drm_intel_bufmgr_gem_set_vma_cache_size(drm_intel_bufmgr *bufmgr, int limit)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bufmgr;
@@ -3032,6 +3053,34 @@ drm_intel_bufmgr_gem_set_vma_cache_size(drm_intel_bufmgr *bufmgr, int limit)
 	bufmgr_gem->vma_max = limit;
 
 	drm_intel_gem_bo_purge_vma_cache(bufmgr_gem);
+}
+
+static int
+parse_devid_override(const char *devid_override)
+{
+	static const struct {
+		const char *name;
+		int pci_id;
+	} name_map[] = {
+		{ "brw", PCI_CHIP_I965_GM },
+		{ "g4x", PCI_CHIP_GM45_GM },
+		{ "ilk", PCI_CHIP_ILD_G },
+		{ "snb", PCI_CHIP_SANDYBRIDGE_M_GT2_PLUS },
+		{ "ivb", PCI_CHIP_IVYBRIDGE_S_GT2 },
+		{ "hsw", PCI_CHIP_HASWELL_CRW_E_GT3 },
+		{ "byt", PCI_CHIP_VALLEYVIEW_3 },
+		{ "bdw", 0x1620 | BDW_ULX },
+		{ "skl", PCI_CHIP_SKYLAKE_DT_GT2 },
+		{ "kbl", PCI_CHIP_KABYLAKE_DT_GT2 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(name_map); i++) {
+		if (!strcmp(name_map[i].name, devid_override))
+			return name_map[i].pci_id;
+	}
+
+	return strtod(devid_override, NULL);
 }
 
 /**
@@ -3050,7 +3099,7 @@ get_pci_device_id(drm_intel_bufmgr_gem *bufmgr_gem)
 		devid_override = getenv("INTEL_DEVID_OVERRIDE");
 		if (devid_override) {
 			bufmgr_gem->no_exec = true;
-			return strtod(devid_override, NULL);
+			return parse_devid_override(devid_override);
 		}
 	}
 
@@ -3065,7 +3114,7 @@ get_pci_device_id(drm_intel_bufmgr_gem *bufmgr_gem)
 	return devid;
 }
 
-int
+drm_public int
 drm_intel_bufmgr_gem_get_devid(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bufmgr;
@@ -3079,7 +3128,7 @@ drm_intel_bufmgr_gem_get_devid(drm_intel_bufmgr *bufmgr)
  * This function has to be called before drm_intel_bufmgr_gem_set_aub_dump()
  * for it to have any effect.
  */
-void
+drm_public void
 drm_intel_bufmgr_gem_set_aub_filename(drm_intel_bufmgr *bufmgr,
 				      const char *filename)
 {
@@ -3093,7 +3142,7 @@ drm_intel_bufmgr_gem_set_aub_filename(drm_intel_bufmgr *bufmgr,
  * You can set up a GTT and upload your objects into the referenced
  * space, then send off batchbuffers and get BMPs out the other end.
  */
-void
+drm_public void
 drm_intel_bufmgr_gem_set_aub_dump(drm_intel_bufmgr *bufmgr, int enable)
 {
 	fprintf(stderr, "libdrm aub dumping is deprecated.\n\n"
@@ -3103,7 +3152,7 @@ drm_intel_bufmgr_gem_set_aub_dump(drm_intel_bufmgr *bufmgr, int enable)
 		"See the intel_aubdump man page for more details.\n");
 }
 
-drm_intel_context *
+drm_public drm_intel_context *
 drm_intel_gem_context_create(drm_intel_bufmgr *bufmgr)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *)bufmgr;
@@ -3130,7 +3179,18 @@ drm_intel_gem_context_create(drm_intel_bufmgr *bufmgr)
 	return context;
 }
 
-void
+drm_public int
+drm_intel_gem_context_get_id(drm_intel_context *ctx, uint32_t *ctx_id)
+{
+	if (ctx == NULL)
+		return -EINVAL;
+
+	*ctx_id = ctx->ctx_id;
+
+	return 0;
+}
+
+drm_public void
 drm_intel_gem_context_destroy(drm_intel_context *ctx)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem;
@@ -3153,7 +3213,7 @@ drm_intel_gem_context_destroy(drm_intel_context *ctx)
 	free(ctx);
 }
 
-int
+drm_public int
 drm_intel_get_reset_stats(drm_intel_context *ctx,
 			  uint32_t *reset_count,
 			  uint32_t *active,
@@ -3187,7 +3247,7 @@ drm_intel_get_reset_stats(drm_intel_context *ctx,
 	return ret;
 }
 
-int
+drm_public int
 drm_intel_reg_read(drm_intel_bufmgr *bufmgr,
 		   uint32_t offset,
 		   uint64_t *result)
@@ -3205,7 +3265,7 @@ drm_intel_reg_read(drm_intel_bufmgr *bufmgr,
 	return ret;
 }
 
-int
+drm_public int
 drm_intel_get_subslice_total(int fd, unsigned int *subslice_total)
 {
 	drm_i915_getparam_t gp;
@@ -3221,7 +3281,7 @@ drm_intel_get_subslice_total(int fd, unsigned int *subslice_total)
 	return 0;
 }
 
-int
+drm_public int
 drm_intel_get_eu_total(int fd, unsigned int *eu_total)
 {
 	drm_i915_getparam_t gp;
@@ -3235,6 +3295,36 @@ drm_intel_get_eu_total(int fd, unsigned int *eu_total)
 		return -errno;
 
 	return 0;
+}
+
+drm_public int
+drm_intel_get_pooled_eu(int fd)
+{
+	drm_i915_getparam_t gp;
+	int ret = -1;
+
+	memclear(gp);
+	gp.param = I915_PARAM_HAS_POOLED_EU;
+	gp.value = &ret;
+	if (drmIoctl(fd, DRM_IOCTL_I915_GETPARAM, &gp))
+		return -errno;
+
+	return ret;
+}
+
+drm_public int
+drm_intel_get_min_eu_in_pool(int fd)
+{
+	drm_i915_getparam_t gp;
+	int ret = -1;
+
+	memclear(gp);
+	gp.param = I915_PARAM_MIN_EU_IN_POOL;
+	gp.value = &ret;
+	if (drmIoctl(fd, DRM_IOCTL_I915_GETPARAM, &gp))
+		return -errno;
+
+	return ret;
 }
 
 /**
@@ -3258,8 +3348,7 @@ drm_intel_get_eu_total(int fd, unsigned int *eu_total)
  * default state (no annotations), call this function with a \c count
  * of zero.
  */
-void
-drm_intel_bufmgr_gem_set_aub_annotations(drm_intel_bo *bo,
+drm_public void drm_intel_bufmgr_gem_set_aub_annotations(drm_intel_bo *bo,
 					 drm_intel_aub_annotation *annotations,
 					 unsigned count)
 {
@@ -3300,20 +3389,154 @@ drm_intel_bufmgr_gem_unref(drm_intel_bufmgr *bufmgr)
 	}
 }
 
+drm_public void *drm_intel_gem_bo_map__gtt(drm_intel_bo *bo)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+
+	if (bo_gem->gtt_virtual)
+		return bo_gem->gtt_virtual;
+
+	if (bo_gem->is_userptr)
+		return NULL;
+
+	pthread_mutex_lock(&bufmgr_gem->lock);
+	if (bo_gem->gtt_virtual == NULL) {
+		struct drm_i915_gem_mmap_gtt mmap_arg;
+		void *ptr;
+
+		DBG("bo_map_gtt: mmap %d (%s), map_count=%d\n",
+		    bo_gem->gem_handle, bo_gem->name, bo_gem->map_count);
+
+		if (bo_gem->map_count++ == 0)
+			drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
+
+		memclear(mmap_arg);
+		mmap_arg.handle = bo_gem->gem_handle;
+
+		/* Get the fake offset back... */
+		ptr = MAP_FAILED;
+		if (drmIoctl(bufmgr_gem->fd,
+			     DRM_IOCTL_I915_GEM_MMAP_GTT,
+			     &mmap_arg) == 0) {
+			/* and mmap it */
+			ptr = drm_mmap(0, bo->size, PROT_READ | PROT_WRITE,
+				       MAP_SHARED, bufmgr_gem->fd,
+				       mmap_arg.offset);
+		}
+		if (ptr == MAP_FAILED) {
+			if (--bo_gem->map_count == 0)
+				drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
+			ptr = NULL;
+		}
+
+		bo_gem->gtt_virtual = ptr;
+	}
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+
+	return bo_gem->gtt_virtual;
+}
+
+drm_public void *drm_intel_gem_bo_map__cpu(drm_intel_bo *bo)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+
+	if (bo_gem->mem_virtual)
+		return bo_gem->mem_virtual;
+
+	if (bo_gem->is_userptr) {
+		/* Return the same user ptr */
+		return bo_gem->user_virtual;
+	}
+
+	pthread_mutex_lock(&bufmgr_gem->lock);
+	if (!bo_gem->mem_virtual) {
+		struct drm_i915_gem_mmap mmap_arg;
+
+		if (bo_gem->map_count++ == 0)
+			drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
+
+		DBG("bo_map: %d (%s), map_count=%d\n",
+		    bo_gem->gem_handle, bo_gem->name, bo_gem->map_count);
+
+		memclear(mmap_arg);
+		mmap_arg.handle = bo_gem->gem_handle;
+		mmap_arg.size = bo->size;
+		if (drmIoctl(bufmgr_gem->fd,
+			     DRM_IOCTL_I915_GEM_MMAP,
+			     &mmap_arg)) {
+			DBG("%s:%d: Error mapping buffer %d (%s): %s .\n",
+			    __FILE__, __LINE__, bo_gem->gem_handle,
+			    bo_gem->name, strerror(errno));
+			if (--bo_gem->map_count == 0)
+				drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
+		} else {
+			VG(VALGRIND_MALLOCLIKE_BLOCK(mmap_arg.addr_ptr, mmap_arg.size, 0, 1));
+			bo_gem->mem_virtual = (void *)(uintptr_t) mmap_arg.addr_ptr;
+		}
+	}
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+
+	return bo_gem->mem_virtual;
+}
+
+drm_public void *drm_intel_gem_bo_map__wc(drm_intel_bo *bo)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+
+	if (bo_gem->wc_virtual)
+		return bo_gem->wc_virtual;
+
+	if (bo_gem->is_userptr)
+		return NULL;
+
+	pthread_mutex_lock(&bufmgr_gem->lock);
+	if (!bo_gem->wc_virtual) {
+		struct drm_i915_gem_mmap mmap_arg;
+
+		if (bo_gem->map_count++ == 0)
+			drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
+
+		DBG("bo_map: %d (%s), map_count=%d\n",
+		    bo_gem->gem_handle, bo_gem->name, bo_gem->map_count);
+
+		memclear(mmap_arg);
+		mmap_arg.handle = bo_gem->gem_handle;
+		mmap_arg.size = bo->size;
+		mmap_arg.flags = I915_MMAP_WC;
+		if (drmIoctl(bufmgr_gem->fd,
+			     DRM_IOCTL_I915_GEM_MMAP,
+			     &mmap_arg)) {
+			DBG("%s:%d: Error mapping buffer %d (%s): %s .\n",
+			    __FILE__, __LINE__, bo_gem->gem_handle,
+			    bo_gem->name, strerror(errno));
+			if (--bo_gem->map_count == 0)
+				drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
+		} else {
+			VG(VALGRIND_MALLOCLIKE_BLOCK(mmap_arg.addr_ptr, mmap_arg.size, 0, 1));
+			bo_gem->wc_virtual = (void *)(uintptr_t) mmap_arg.addr_ptr;
+		}
+	}
+	pthread_mutex_unlock(&bufmgr_gem->lock);
+
+	return bo_gem->wc_virtual;
+}
+
 /**
  * Initializes the GEM buffer manager, which uses the kernel to allocate, map,
  * and manage map buffer objections.
  *
  * \param fd File descriptor of the opened DRM device.
  */
-drm_intel_bufmgr *
+drm_public drm_intel_bufmgr *
 drm_intel_bufmgr_gem_init(int fd, int batch_size)
 {
 	drm_intel_bufmgr_gem *bufmgr_gem;
 	struct drm_i915_gem_get_aperture aperture;
 	drm_i915_getparam_t gp;
 	int ret, tmp;
-	bool exec2 = false;
 
 	pthread_mutex_lock(&bufmgr_list_mutex);
 
@@ -3367,9 +3590,7 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 		bufmgr_gem->gen = 7;
 	else if (IS_GEN8(bufmgr_gem->pci_device))
 		bufmgr_gem->gen = 8;
-	else if (IS_GEN9(bufmgr_gem->pci_device))
-		bufmgr_gem->gen = 9;
-	else {
+	else if (!intel_get_genx(bufmgr_gem->pci_device, &bufmgr_gem->gen)) {
 		free(bufmgr_gem);
 		bufmgr_gem = NULL;
 		goto exit;
@@ -3379,7 +3600,7 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 	    bufmgr_gem->gtt_size > 256*1024*1024) {
 		/* The unmappable part of gtt on gen 3 (i.e. above 256MB) can't
 		 * be used for tiled blits. To simplify the accounting, just
-		 * substract the unmappable part (fixed to 256MB on all known
+		 * subtract the unmappable part (fixed to 256MB on all known
 		 * gen3 devices) if the kernel advertises it. */
 		bufmgr_gem->gtt_size -= 256*1024*1024;
 	}
@@ -3389,8 +3610,12 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 
 	gp.param = I915_PARAM_HAS_EXECBUF2;
 	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GETPARAM, &gp);
-	if (!ret)
-		exec2 = true;
+	if (ret) {
+		fprintf(stderr, "i915 does not support EXECBUFER2\n");
+		free(bufmgr_gem);
+		bufmgr_gem = NULL;
+        goto exit;
+    }
 
 	gp.param = I915_PARAM_HAS_BSD;
 	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GETPARAM, &gp);
@@ -3403,6 +3628,10 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 	gp.param = I915_PARAM_HAS_RELAXED_FENCING;
 	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GETPARAM, &gp);
 	bufmgr_gem->has_relaxed_fencing = ret == 0;
+
+	gp.param = I915_PARAM_HAS_EXEC_ASYNC;
+	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GETPARAM, &gp);
+	bufmgr_gem->has_exec_async = ret == 0;
 
 	bufmgr_gem->bufmgr.bo_alloc_userptr = check_bo_alloc_userptr;
 
@@ -3489,12 +3718,8 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 	bufmgr_gem->bufmgr.bo_get_tiling = drm_intel_gem_bo_get_tiling;
 	bufmgr_gem->bufmgr.bo_set_tiling = drm_intel_gem_bo_set_tiling;
 	bufmgr_gem->bufmgr.bo_flink = drm_intel_gem_bo_flink;
-	/* Use the new one if available */
-	if (exec2) {
-		bufmgr_gem->bufmgr.bo_exec = drm_intel_gem_bo_exec2;
-		bufmgr_gem->bufmgr.bo_mrb_exec = drm_intel_gem_bo_mrb_exec2;
-	} else
-		bufmgr_gem->bufmgr.bo_exec = drm_intel_gem_bo_exec;
+	bufmgr_gem->bufmgr.bo_exec = drm_intel_gem_bo_exec2;
+	bufmgr_gem->bufmgr.bo_mrb_exec = drm_intel_gem_bo_mrb_exec2;
 	bufmgr_gem->bufmgr.bo_busy = drm_intel_gem_bo_busy;
 	bufmgr_gem->bufmgr.bo_madvise = drm_intel_gem_bo_madvise;
 	bufmgr_gem->bufmgr.destroy = drm_intel_bufmgr_gem_unref;
@@ -3507,7 +3732,6 @@ drm_intel_bufmgr_gem_init(int fd, int batch_size)
 	    drm_intel_gem_get_pipe_from_crtc_id;
 	bufmgr_gem->bufmgr.bo_references = drm_intel_gem_bo_references;
 
-	DRMINITLISTHEAD(&bufmgr_gem->named);
 	init_cache_buckets(bufmgr_gem);
 
 	DRMINITLISTHEAD(&bufmgr_gem->vma_cache);

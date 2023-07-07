@@ -22,10 +22,6 @@
  * Authors: Ben Skeggs
  */
 
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -50,19 +46,35 @@
 #include "nvif/ioctl.h"
 #include "nvif/unpack.h"
 
-#ifdef DEBUG
+drm_private FILE *nouveau_out = NULL;
 drm_private uint32_t nouveau_debug = 0;
 
 static void
-debug_init(char *args)
+debug_init(void)
 {
-	if (args) {
-		int n = strtol(args, NULL, 0);
+	static bool once = false;
+	char *debug, *out;
+
+	if (once)
+		return;
+	once = true;
+
+	debug = getenv("NOUVEAU_LIBDRM_DEBUG");
+	if (debug) {
+		int n = strtol(debug, NULL, 0);
 		if (n >= 0)
 			nouveau_debug = n;
+
+	}
+
+	nouveau_out = stderr;
+	out = getenv("NOUVEAU_LIBDRM_OUT");
+	if (out) {
+		FILE *fout = fopen(out, "w");
+		if (fout)
+			nouveau_out = fout;
 	}
 }
-#endif
 
 static int
 nouveau_object_ioctl(struct nouveau_object *obj, void *data, uint32_t size)
@@ -92,7 +104,7 @@ nouveau_object_ioctl(struct nouveau_object *obj, void *data, uint32_t size)
 	return drmCommandWriteRead(drm->fd, DRM_NOUVEAU_NVIF, args, argc);
 }
 
-int
+drm_public int
 nouveau_object_mthd(struct nouveau_object *obj,
 		    uint32_t mthd, void *data, uint32_t size)
 {
@@ -127,14 +139,14 @@ nouveau_object_mthd(struct nouveau_object *obj,
 	return ret;
 }
 
-void
+drm_public void
 nouveau_object_sclass_put(struct nouveau_sclass **psclass)
 {
 	free(*psclass);
 	*psclass = NULL;
 }
 
-int
+drm_public int
 nouveau_object_sclass_get(struct nouveau_object *obj,
 			  struct nouveau_sclass **psclass)
 {
@@ -184,7 +196,7 @@ nouveau_object_sclass_get(struct nouveau_object *obj,
 	return ret;
 }
 
-int
+drm_public int
 nouveau_object_mclass(struct nouveau_object *obj,
 		      const struct nouveau_mclass *mclass)
 {
@@ -286,7 +298,7 @@ nouveau_object_init(struct nouveau_object *parent, uint32_t handle,
 	return 0;
 }
 
-int
+drm_public int
 nouveau_object_new(struct nouveau_object *parent, uint64_t handle,
 		   uint32_t oclass, void *data, uint32_t length,
 		   struct nouveau_object **pobj)
@@ -307,7 +319,7 @@ nouveau_object_new(struct nouveau_object *parent, uint64_t handle,
 	return 0;
 }
 
-void
+drm_public void
 nouveau_object_del(struct nouveau_object **pobj)
 {
 	struct nouveau_object *obj = *pobj;
@@ -318,22 +330,20 @@ nouveau_object_del(struct nouveau_object **pobj)
 	}
 }
 
-void
+drm_public void
 nouveau_drm_del(struct nouveau_drm **pdrm)
 {
 	free(*pdrm);
 	*pdrm = NULL;
 }
 
-int
+drm_public int
 nouveau_drm_new(int fd, struct nouveau_drm **pdrm)
 {
 	struct nouveau_drm *drm;
 	drmVersionPtr ver;
 
-#ifdef DEBUG
-	debug_init(getenv("NOUVEAU_LIBDRM_DEBUG"));
-#endif
+	debug_init();
 
 	if (!(drm = calloc(1, sizeof(*drm))))
 		return -ENOMEM;
@@ -357,14 +367,14 @@ nouveau_drm_new(int fd, struct nouveau_drm **pdrm)
  * is kept here to prevent AIGLX from crashing if the DDX is linked against
  * the new libdrm, but the DRI driver against the old
  */
-int
+drm_public int
 nouveau_device_open_existing(struct nouveau_device **pdev, int close, int fd,
 			     drm_context_t ctx)
 {
 	return -EACCES;
 }
 
-int
+drm_public int
 nouveau_device_new(struct nouveau_object *parent, int32_t oclass,
 		   void *data, uint32_t size, struct nouveau_device **pdev)
 {
@@ -458,7 +468,7 @@ done:
 	return ret;
 }
 
-int
+drm_public int
 nouveau_device_wrap(int fd, int close, struct nouveau_device **pdev)
 {
 	struct nouveau_drm *drm;
@@ -486,7 +496,7 @@ nouveau_device_wrap(int fd, int close, struct nouveau_device **pdev)
 	return 0;
 }
 
-int
+drm_public int
 nouveau_device_open(const char *busid, struct nouveau_device **pdev)
 {
 	int ret = -ENODEV, fd = drmOpen("nouveau", busid);
@@ -498,7 +508,7 @@ nouveau_device_open(const char *busid, struct nouveau_device **pdev)
 	return ret;
 }
 
-void
+drm_public void
 nouveau_device_del(struct nouveau_device **pdev)
 {
 	struct nouveau_device_priv *nvdev = nouveau_device(*pdev);
@@ -517,7 +527,7 @@ nouveau_device_del(struct nouveau_device **pdev)
 	}
 }
 
-int
+drm_public int
 nouveau_getparam(struct nouveau_device *dev, uint64_t param, uint64_t *value)
 {
 	struct nouveau_drm *drm = nouveau_drm(&dev->object);
@@ -528,7 +538,7 @@ nouveau_getparam(struct nouveau_device *dev, uint64_t param, uint64_t *value)
 	return ret;
 }
 
-int
+drm_public int
 nouveau_setparam(struct nouveau_device *dev, uint64_t param, uint64_t value)
 {
 	struct nouveau_drm *drm = nouveau_drm(&dev->object);
@@ -536,7 +546,7 @@ nouveau_setparam(struct nouveau_device *dev, uint64_t param, uint64_t value)
 	return drmCommandWrite(drm->fd, DRM_NOUVEAU_SETPARAM, &r, sizeof(r));
 }
 
-int
+drm_public int
 nouveau_client_new(struct nouveau_device *dev, struct nouveau_client **pclient)
 {
 	struct nouveau_device_priv *nvdev = nouveau_device(dev);
@@ -575,7 +585,7 @@ unlock:
 	return ret;
 }
 
-void
+drm_public void
 nouveau_client_del(struct nouveau_client **pclient)
 {
 	struct nouveau_client_priv *pcli = nouveau_client(*pclient);
@@ -597,7 +607,6 @@ nouveau_bo_del(struct nouveau_bo *bo)
 	struct nouveau_drm *drm = nouveau_drm(&bo->device->object);
 	struct nouveau_device_priv *nvdev = nouveau_device(bo->device);
 	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
-	struct drm_gem_close req = { .handle = bo->handle };
 
 	if (nvbo->head.next) {
 		pthread_mutex_lock(&nvdev->lock);
@@ -611,18 +620,18 @@ nouveau_bo_del(struct nouveau_bo *bo)
 			 * might cause the bo to be closed accidentally while
 			 * re-importing.
 			 */
-			drmIoctl(drm->fd, DRM_IOCTL_GEM_CLOSE, &req);
+			drmCloseBufferHandle(drm->fd, bo->handle);
 		}
 		pthread_mutex_unlock(&nvdev->lock);
 	} else {
-		drmIoctl(drm->fd, DRM_IOCTL_GEM_CLOSE, &req);
+		drmCloseBufferHandle(drm->fd, bo->handle);
 	}
 	if (bo->map)
 		drm_munmap(bo->map, bo->size);
 	free(nvbo);
 }
 
-int
+drm_public int
 nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
 	       uint64_t size, union nouveau_bo_config *config,
 	       struct nouveau_bo **pbo)
@@ -713,7 +722,7 @@ nouveau_bo_make_global(struct nouveau_bo_priv *nvbo)
 	}
 }
 
-int
+drm_public int
 nouveau_bo_wrap(struct nouveau_device *dev, uint32_t handle,
 		struct nouveau_bo **pbo)
 {
@@ -725,7 +734,7 @@ nouveau_bo_wrap(struct nouveau_device *dev, uint32_t handle,
 	return ret;
 }
 
-int
+drm_public int
 nouveau_bo_name_ref(struct nouveau_device *dev, uint32_t name,
 		    struct nouveau_bo **pbo)
 {
@@ -754,7 +763,7 @@ nouveau_bo_name_ref(struct nouveau_device *dev, uint32_t name,
 	return ret;
 }
 
-int
+drm_public int
 nouveau_bo_name_get(struct nouveau_bo *bo, uint32_t *name)
 {
 	struct drm_gem_flink req = { .handle = bo->handle };
@@ -776,7 +785,7 @@ nouveau_bo_name_get(struct nouveau_bo *bo, uint32_t *name)
 	return 0;
 }
 
-void
+drm_public void
 nouveau_bo_ref(struct nouveau_bo *bo, struct nouveau_bo **pref)
 {
 	struct nouveau_bo *ref = *pref;
@@ -790,7 +799,7 @@ nouveau_bo_ref(struct nouveau_bo *bo, struct nouveau_bo **pref)
 	*pref = bo;
 }
 
-int
+drm_public int
 nouveau_bo_prime_handle_ref(struct nouveau_device *dev, int prime_fd,
 			    struct nouveau_bo **bo)
 {
@@ -810,7 +819,7 @@ nouveau_bo_prime_handle_ref(struct nouveau_device *dev, int prime_fd,
 	return ret;
 }
 
-int
+drm_public int
 nouveau_bo_set_prime(struct nouveau_bo *bo, int *prime_fd)
 {
 	struct nouveau_drm *drm = nouveau_drm(&bo->device->object);
@@ -825,7 +834,7 @@ nouveau_bo_set_prime(struct nouveau_bo *bo, int *prime_fd)
 	return 0;
 }
 
-int
+drm_public int
 nouveau_bo_wait(struct nouveau_bo *bo, uint32_t access,
 		struct nouveau_client *client)
 {
@@ -860,7 +869,7 @@ nouveau_bo_wait(struct nouveau_bo *bo, uint32_t access,
 	return ret;
 }
 
-int
+drm_public int
 nouveau_bo_map(struct nouveau_bo *bo, uint32_t access,
 	       struct nouveau_client *client)
 {

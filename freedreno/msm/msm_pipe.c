@@ -26,12 +26,27 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#ifdef HAVE_CONFIG_H
-# include <config.h>
-#endif
-
 #include "msm_priv.h"
 
+static int query_param(struct fd_pipe *pipe, uint32_t param,
+		uint64_t *value)
+{
+	struct msm_pipe *msm_pipe = to_msm_pipe(pipe);
+	struct drm_msm_param req = {
+			.pipe = msm_pipe->pipe,
+			.param = param,
+	};
+	int ret;
+
+	ret = drmCommandWriteRead(pipe->dev->fd, DRM_MSM_GET_PARAM,
+			&req, sizeof(req));
+	if (ret)
+		return ret;
+
+	*value = req.value;
+
+	return 0;
+}
 
 static int msm_pipe_get_param(struct fd_pipe *pipe,
 		enum fd_param_id param, uint64_t *value)
@@ -48,6 +63,12 @@ static int msm_pipe_get_param(struct fd_pipe *pipe,
 	case FD_CHIP_ID:
 		*value = msm_pipe->chip_id;
 		return 0;
+	case FD_MAX_FREQ:
+		return query_param(pipe, MSM_PARAM_MAX_FREQ, value);
+	case FD_TIMESTAMP:
+		return query_param(pipe, MSM_PARAM_TIMESTAMP, value);
+	case FD_NR_RINGS:
+		return query_param(pipe, MSM_PARAM_NR_RINGS, value);
 	default:
 		ERROR_MSG("invalid param id: %d", param);
 		return -1;
@@ -60,6 +81,7 @@ static int msm_pipe_wait(struct fd_pipe *pipe, uint32_t timestamp,
 	struct fd_device *dev = pipe->dev;
 	struct drm_msm_wait_fence req = {
 			.fence = timestamp,
+			.queueid = to_msm_pipe(pipe)->queue_id,
 	};
 	int ret;
 
@@ -74,9 +96,54 @@ static int msm_pipe_wait(struct fd_pipe *pipe, uint32_t timestamp,
 	return 0;
 }
 
+static int open_submitqueue(struct fd_pipe *pipe, uint32_t prio)
+{
+	struct drm_msm_submitqueue req = {
+		.flags = 0,
+		.prio = prio,
+	};
+	uint64_t nr_rings = 1;
+	int ret;
+
+	if (fd_device_version(pipe->dev) < FD_VERSION_SUBMIT_QUEUES) {
+		to_msm_pipe(pipe)->queue_id = 0;
+		return 0;
+	}
+
+	msm_pipe_get_param(pipe, FD_NR_RINGS, &nr_rings);
+
+	req.prio = MIN2(req.prio, MAX2(nr_rings, 1) - 1);
+
+	ret = drmCommandWriteRead(pipe->dev->fd, DRM_MSM_SUBMITQUEUE_NEW,
+			&req, sizeof(req));
+	if (ret) {
+		ERROR_MSG("could not create submitqueue! %d (%s)", ret, strerror(errno));
+		return ret;
+	}
+
+	to_msm_pipe(pipe)->queue_id = req.id;
+	return 0;
+}
+
+static void close_submitqueue(struct fd_pipe *pipe, uint32_t queue_id)
+{
+	if (fd_device_version(pipe->dev) < FD_VERSION_SUBMIT_QUEUES)
+		return;
+
+	drmCommandWrite(pipe->dev->fd, DRM_MSM_SUBMITQUEUE_CLOSE,
+			&queue_id, sizeof(queue_id));
+}
+
 static void msm_pipe_destroy(struct fd_pipe *pipe)
 {
 	struct msm_pipe *msm_pipe = to_msm_pipe(pipe);
+	close_submitqueue(pipe, msm_pipe->queue_id);
+
+	if (msm_pipe->suballoc_ring) {
+		fd_ringbuffer_del(msm_pipe->suballoc_ring);
+		msm_pipe->suballoc_ring = NULL;
+	}
+
 	free(msm_pipe);
 }
 
@@ -87,25 +154,19 @@ static const struct fd_pipe_funcs funcs = {
 		.destroy = msm_pipe_destroy,
 };
 
-static uint64_t get_param(struct fd_device *dev, uint32_t pipe, uint32_t param)
+static uint64_t get_param(struct fd_pipe *pipe, uint32_t param)
 {
-	struct drm_msm_param req = {
-			.pipe = pipe,
-			.param = param,
-	};
-	int ret;
-
-	ret = drmCommandWriteRead(dev->fd, DRM_MSM_GET_PARAM, &req, sizeof(req));
+	uint64_t value;
+	int ret = query_param(pipe, param, &value);
 	if (ret) {
 		ERROR_MSG("get-param failed! %d (%s)", ret, strerror(errno));
 		return 0;
 	}
-
-	return req.value;
+	return value;
 }
 
 drm_private struct fd_pipe * msm_pipe_new(struct fd_device *dev,
-		enum fd_pipe_id id)
+		enum fd_pipe_id id, uint32_t prio)
 {
 	static const uint32_t pipe_id[] = {
 			[FD_PIPE_3D] = MSM_PIPE_3D0,
@@ -123,10 +184,14 @@ drm_private struct fd_pipe * msm_pipe_new(struct fd_device *dev,
 	pipe = &msm_pipe->base;
 	pipe->funcs = &funcs;
 
+	/* initialize before get_param(): */
+	pipe->dev = dev;
 	msm_pipe->pipe = pipe_id[id];
-	msm_pipe->gpu_id = get_param(dev, pipe_id[id], MSM_PARAM_GPU_ID);
-	msm_pipe->gmem   = get_param(dev, pipe_id[id], MSM_PARAM_GMEM_SIZE);
-	msm_pipe->chip_id = get_param(dev, pipe_id[id], MSM_PARAM_CHIP_ID);
+
+	/* these params should be supported since the first version of drm/msm: */
+	msm_pipe->gpu_id = get_param(pipe, MSM_PARAM_GPU_ID);
+	msm_pipe->gmem   = get_param(pipe, MSM_PARAM_GMEM_SIZE);
+	msm_pipe->chip_id = get_param(pipe, MSM_PARAM_CHIP_ID);
 
 	if (! msm_pipe->gpu_id)
 		goto fail;
@@ -135,6 +200,9 @@ drm_private struct fd_pipe * msm_pipe_new(struct fd_device *dev,
 	INFO_MSG(" GPU-id:          %d", msm_pipe->gpu_id);
 	INFO_MSG(" Chip-id:         0x%08x", msm_pipe->chip_id);
 	INFO_MSG(" GMEM size:       0x%08x", msm_pipe->gmem);
+
+	if (open_submitqueue(pipe, prio))
+		goto fail;
 
 	return pipe;
 fail:

@@ -126,7 +126,7 @@ dump_prop(uint32_t prop_id, uint64_t value)
 	if (drm_property_type_is(prop, DRM_MODE_PROP_ENUM)) {
 		printf("\t\tenums:");
 		for (i = 0; i < prop->count_enums; i++)
-			printf(" %s=%llu", prop->enums[i].name,
+			printf(" %s=%"PRIu64, prop->enums[i].name,
 			       prop->enums[i].value);
 		printf("\n");
 	} else if (drm_property_type_is(prop, DRM_MODE_PROP_BITMASK)) {
@@ -151,6 +151,8 @@ dump_prop(uint32_t prop_id, uint64_t value)
 	printf("\t\tvalue:");
 	if (drm_property_type_is(prop, DRM_MODE_PROP_BLOB))
 		dump_blob(value);
+	else if (drm_property_type_is(prop, DRM_MODE_PROP_SIGNED_RANGE))
+		printf(" %"PRId64"\n", value);
 	else
 		printf(" %"PRIu64"\n", value);
 
@@ -295,7 +297,7 @@ int main(int argc, char *argv[])
 
 	args = argc - optind;
 
-	fd = util_open(module, device);
+	fd = util_open(device, module);
 	if (fd < 0)
 		return 1;
 

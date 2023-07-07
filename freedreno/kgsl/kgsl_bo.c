@@ -26,10 +26,6 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#ifdef HAVE_CONFIG_H
-# include <config.h>
-#endif
-
 #include "kgsl_priv.h"
 
 #include <linux/fb.h>
@@ -116,6 +112,11 @@ static void kgsl_bo_cpu_fini(struct fd_bo *bo)
 {
 }
 
+static int kgsl_bo_madvise(struct fd_bo *bo, int willneed)
+{
+	return willneed; /* not supported by kgsl */
+}
+
 static void kgsl_bo_destroy(struct fd_bo *bo)
 {
 	struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
@@ -127,6 +128,7 @@ static const struct fd_bo_funcs funcs = {
 		.offset = kgsl_bo_offset,
 		.cpu_prep = kgsl_bo_cpu_prep,
 		.cpu_fini = kgsl_bo_cpu_fini,
+		.madvise = kgsl_bo_madvise,
 		.destroy = kgsl_bo_destroy,
 };
 
@@ -175,7 +177,7 @@ drm_private struct fd_bo * kgsl_bo_from_handle(struct fd_device *dev,
 	return bo;
 }
 
-struct fd_bo *
+drm_public struct fd_bo *
 fd_bo_from_fbdev(struct fd_pipe *pipe, int fbfd, uint32_t size)
 {
 	struct fd_bo *bo;

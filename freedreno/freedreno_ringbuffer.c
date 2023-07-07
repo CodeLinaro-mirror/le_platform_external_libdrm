@@ -26,51 +26,81 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#ifdef HAVE_CONFIG_H
-# include <config.h>
-#endif
-
 #include <assert.h>
 
 #include "freedreno_drmif.h"
 #include "freedreno_priv.h"
 #include "freedreno_ringbuffer.h"
 
-struct fd_ringbuffer *
-fd_ringbuffer_new(struct fd_pipe *pipe, uint32_t size)
+drm_public struct fd_ringbuffer *
+fd_ringbuffer_new_flags(struct fd_pipe *pipe, uint32_t size,
+		enum fd_ringbuffer_flags flags)
 {
 	struct fd_ringbuffer *ring;
 
-	ring = pipe->funcs->ringbuffer_new(pipe, size);
+	/* we can't really support "growable" rb's in general for
+	 * stateobj's since we need a single gpu addr (ie. can't
+	 * do the trick of a chain of IB packets):
+	 */
+	if (flags & FD_RINGBUFFER_OBJECT)
+		assert(size);
+
+	ring = pipe->funcs->ringbuffer_new(pipe, size, flags);
 	if (!ring)
 		return NULL;
 
-	ring->size = size;
+	ring->flags = flags;
 	ring->pipe = pipe;
 	ring->start = ring->funcs->hostptr(ring);
-	ring->end = &(ring->start[size/4]);
+	ring->end = &(ring->start[ring->size/4]);
 
 	ring->cur = ring->last_start = ring->start;
 
 	return ring;
 }
 
-void fd_ringbuffer_del(struct fd_ringbuffer *ring)
+drm_public struct fd_ringbuffer *
+fd_ringbuffer_new(struct fd_pipe *pipe, uint32_t size)
 {
+	return fd_ringbuffer_new_flags(pipe, size, 0);
+}
+
+drm_public struct fd_ringbuffer *
+fd_ringbuffer_new_object(struct fd_pipe *pipe, uint32_t size)
+{
+	return fd_ringbuffer_new_flags(pipe, size, FD_RINGBUFFER_OBJECT);
+}
+
+drm_public void fd_ringbuffer_del(struct fd_ringbuffer *ring)
+{
+	if (!atomic_dec_and_test(&ring->refcnt))
+		return;
+
+	fd_ringbuffer_reset(ring);
 	ring->funcs->destroy(ring);
+}
+
+drm_public struct fd_ringbuffer *
+fd_ringbuffer_ref(struct fd_ringbuffer *ring)
+{
+	STATIC_ASSERT(sizeof(ring->refcnt) <= sizeof(ring->__pad));
+	atomic_inc(&ring->refcnt);
+	return ring;
 }
 
 /* ringbuffers which are IB targets should set the toplevel rb (ie.
  * the IB source) as it's parent before emitting reloc's, to ensure
  * the bookkeeping works out properly.
  */
-void fd_ringbuffer_set_parent(struct fd_ringbuffer *ring,
+drm_public void fd_ringbuffer_set_parent(struct fd_ringbuffer *ring,
 					 struct fd_ringbuffer *parent)
 {
+	/* state objects should not be parented! */
+	assert(!(ring->flags & FD_RINGBUFFER_OBJECT));
 	ring->parent = parent;
 }
 
-void fd_ringbuffer_reset(struct fd_ringbuffer *ring)
+drm_public void fd_ringbuffer_reset(struct fd_ringbuffer *ring)
 {
 	uint32_t *start = ring->start;
 	if (ring->pipe->id == FD_PIPE_2D)
@@ -80,67 +110,73 @@ void fd_ringbuffer_reset(struct fd_ringbuffer *ring)
 		ring->funcs->reset(ring);
 }
 
-/* maybe get rid of this and use fd_ringmarker_flush() from DDX too? */
-int fd_ringbuffer_flush(struct fd_ringbuffer *ring)
+drm_public int fd_ringbuffer_flush(struct fd_ringbuffer *ring)
 {
-	return ring->funcs->flush(ring, ring->last_start);
+	return ring->funcs->flush(ring, ring->last_start, -1, NULL);
 }
 
-uint32_t fd_ringbuffer_timestamp(struct fd_ringbuffer *ring)
+drm_public int fd_ringbuffer_flush2(struct fd_ringbuffer *ring, int in_fence_fd,
+		int *out_fence_fd)
+{
+	return ring->funcs->flush(ring, ring->last_start, in_fence_fd, out_fence_fd);
+}
+
+drm_public void fd_ringbuffer_grow(struct fd_ringbuffer *ring, uint32_t ndwords)
+{
+	assert(ring->funcs->grow);     /* unsupported on kgsl */
+
+	/* there is an upper bound on IB size, which appears to be 0x100000 */
+	if (ring->size < 0x100000)
+		ring->size *= 2;
+
+	ring->funcs->grow(ring, ring->size);
+
+	ring->start = ring->funcs->hostptr(ring);
+	ring->end = &(ring->start[ring->size/4]);
+
+	ring->cur = ring->last_start = ring->start;
+}
+
+drm_public uint32_t fd_ringbuffer_timestamp(struct fd_ringbuffer *ring)
 {
 	return ring->last_timestamp;
 }
 
-void fd_ringbuffer_reloc(struct fd_ringbuffer *ring,
+drm_public void fd_ringbuffer_reloc(struct fd_ringbuffer *ring,
 				    const struct fd_reloc *reloc)
+{
+	assert(ring->pipe->gpu_id < 500);
+	ring->funcs->emit_reloc(ring, reloc);
+}
+
+drm_public void fd_ringbuffer_reloc2(struct fd_ringbuffer *ring,
+				     const struct fd_reloc *reloc)
 {
 	ring->funcs->emit_reloc(ring, reloc);
 }
 
-void
-fd_ringbuffer_emit_reloc_ring(struct fd_ringbuffer *ring,
-			      struct fd_ringmarker *target,
-			      struct fd_ringmarker *end)
+drm_public uint32_t fd_ringbuffer_cmd_count(struct fd_ringbuffer *ring)
 {
-	assert(target->ring == end->ring);
-	ring->funcs->emit_reloc_ring(ring, target, end);
+	if (!ring->funcs->cmd_count)
+		return 1;
+	return ring->funcs->cmd_count(ring);
 }
 
-struct fd_ringmarker * fd_ringmarker_new(struct fd_ringbuffer *ring)
+drm_public uint32_t
+fd_ringbuffer_emit_reloc_ring_full(struct fd_ringbuffer *ring,
+		struct fd_ringbuffer *target, uint32_t cmd_idx)
 {
-	struct fd_ringmarker *marker = NULL;
-
-	marker = calloc(1, sizeof(*marker));
-	if (!marker) {
-		ERROR_MSG("allocation failed");
-		return NULL;
-	}
-
-	marker->ring = ring;
-
-	fd_ringmarker_mark(marker);
-
-	return marker;
+	return ring->funcs->emit_reloc_ring(ring, target, cmd_idx);
 }
 
-void fd_ringmarker_del(struct fd_ringmarker *marker)
+drm_public uint32_t
+fd_ringbuffer_size(struct fd_ringbuffer *ring)
 {
-	free(marker);
+	/* only really needed for stateobj ringbuffers, and won't really
+	 * do what you expect for growable rb's.. so lets just restrict
+	 * this to stateobj's for now:
+	 */
+	assert(ring->flags & FD_RINGBUFFER_OBJECT);
+	return offset_bytes(ring->cur, ring->start);
 }
 
-void fd_ringmarker_mark(struct fd_ringmarker *marker)
-{
-	marker->cur = marker->ring->cur;
-}
-
-uint32_t fd_ringmarker_dwords(struct fd_ringmarker *start,
-					 struct fd_ringmarker *end)
-{
-	return end->cur - start->cur;
-}
-
-int fd_ringmarker_flush(struct fd_ringmarker *marker)
-{
-	struct fd_ringbuffer *ring = marker->ring;
-	return ring->funcs->flush(ring, marker->cur);
-}
