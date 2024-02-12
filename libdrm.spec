@@ -27,7 +27,7 @@ header files libdrm
 # the setting.  Thanks to the SuSE folks for the workaround.
 export LDFLAGS="%{?build_ldflags} -Wl,-z,undefs"
 
-%meson -Denable_drm-fe=yes -Dman_pages=false
+%meson -Denable_drm-fe=yes -Dman-pages=false
 %meson_build
 
 %install
