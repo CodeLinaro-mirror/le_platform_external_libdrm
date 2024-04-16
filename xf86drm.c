@@ -3432,6 +3432,7 @@ static bool drmNodeIsDRM(int maj, int min)
 
     if (!devname_r(makedev(maj, min), S_IFCHR, name, sizeof(name)))
       return 0;
+
     /* Handle drm/ and dri/ as both are present in different FreeBSD version
      * FreeBSD on amd64/i386/powerpc external kernel modules create node in
      * in /dev/drm/ and links in /dev/dri while a WIP in kernel driver creates
@@ -3622,7 +3623,12 @@ static char *drmGetMinorNameForFD(int fd, int type)
 
 drm_public char *drmGetPrimaryDeviceNameFromFd(int fd)
 {
+#ifdef DRM_FE
+	char name[] = "/dev/dri/card0";
+	return strdup(name);
+#else
     return drmGetMinorNameForFD(fd, DRM_NODE_PRIMARY);
+#endif
 }
 
 drm_public char *drmGetRenderDeviceNameFromFd(int fd)
