@@ -141,6 +141,20 @@ with_vc4 = get_option('vc4') \
   .allowed()
 summary('VC4', with_vc4)
 
+with_drm_fe = false
+dep_dl = cc.find_library('dl')
+_drm_fe = get_option('enable_drm-fe')
+if _drm_fe == 'yes'
+  with_drm_fe = true
+  config.set('HAVE_DRM_FE', 1)
+  add_project_arguments('-DDRM_FE', language : 'c')
+  add_project_arguments('-DLIBDIR='+'"/usr/lib"', language : 'c')
+  fedep_dl = cc.find_library('dl')
+else
+  fedep_dl = []
+endif
+summary('DRM_FE', with_drm_fe)
+
 # Among others FreeBSD does not have a separate dl library.
 if not cc.has_function('dlsym')
   dep_dl = cc.find_library('dl', required : with_nouveau)
@@ -254,11 +268,11 @@ else
   libdrm_kw = {'version' : '2.4.0'}
 endif
 
-libdrm = library(
+libdrm = shared_library(
   'drm',
   libdrm_files,
   c_args : libdrm_c_args,
-  dependencies : [dep_valgrind, dep_rt, dep_m],
+  dependencies : [dep_valgrind, dep_rt, dep_m, fedep_dl],
   include_directories : inc_drm,
   install : true,
   kwargs : libdrm_kw,
@@ -284,7 +298,7 @@ if meson.version().version_compare('>= 0.54.0')
   meson.override_dependency('libdrm', ext_libdrm)
 endif
 
-install_headers('libsync.h', 'xf86drm.h', 'xf86drmMode.h')
+install_headers('libsync.h', 'xf86drm.h', 'xf86drmMode.h', 'libdrm_lists.h')
 install_headers(
   'include/drm/drm.h', 'include/drm/drm_fourcc.h', 'include/drm/drm_mode.h',
   'include/drm/drm_sarea.h', 'include/drm/i915_drm.h',
@@ -345,3 +359,7 @@ subdir('data')
 if with_tests
   subdir('tests')
 endif
+
+message('')
+message('  DRM FE API     @0@'.format(with_drm_fe))
+message('')

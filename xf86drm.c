@@ -29,6 +29,10 @@
  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
+
+ * Changes from Qualcomm Technologies, Inc. are provided under the following license:
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 
 #include <stdio.h>
@@ -78,6 +82,11 @@
 #include "xf86drm.h"
 #include "libdrm_macros.h"
 #include "drm_fourcc.h"
+
+#ifdef DRM_FE
+#include "fe_drm.h"
+#include "dlfcn.h"
+#endif
 
 #include "util_math.h"
 
@@ -692,6 +701,60 @@ drm_public void drmFree(void *pt)
     free(pt);
 }
 
+#ifdef DRM_FE
+void drm_place_marker(const char *name)
+{
+	int fd = open("/sys/kernel/debug/bootkpi/kpi_values", O_WRONLY);
+
+	if (fd > 0) {
+		write(fd, name, strlen(name));
+		close(fd);
+	}
+}
+
+void * load_drm_fe_module(const char *name, const char *entrypoint)
+{
+	char path[1024];
+	void *module, *interface;
+
+	if (name == NULL)
+		return NULL;
+
+	snprintf(path, sizeof path, "%s/%s", LIBDIR, name);
+
+	module = dlopen(path, RTLD_NOW);
+	if (!module) {
+		printf("Failed to load module: %s\n", dlerror());
+		return NULL;
+	}
+
+	interface = dlsym(module, entrypoint);
+	if (!interface) {
+		printf("Failed to lookup interface: %s\n", dlerror());
+		dlclose(module);
+		return NULL;
+	}
+
+	return interface;
+}
+
+struct drm_interface_fe *drm_interface_fe = NULL;
+
+void *get_drm_fe(void)
+{
+	if (!drm_interface_fe) {
+		drm_interface_fe =
+			load_drm_fe_module(
+				"lib_drm_fe.so",
+				"drm_interface_fe");
+		if (!drm_interface_fe)
+			printf("GK - load drm_fe failed!\n");
+	}
+
+	return drm_interface_fe;
+}
+#endif
+
 /**
  * Call ioctl, restarting if it is interrupted
  */
@@ -699,9 +762,19 @@ drm_public int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
     int ret;
-
+#ifdef DRM_FE
+    struct drm_interface_fe *drm_intf_fe;
+    drm_intf_fe = get_drm_fe();
+    if (!drm_intf_fe) {
+        return -EINVAL;
+    }
+#endif
     do {
+#ifdef DRM_FE
+        ret = drm_intf_fe->drmioctl_fe(fd, request, arg);
+#else
         ret = ioctl(fd, request, arg);
+#endif
     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
     return ret;
 }
@@ -860,6 +933,16 @@ static int drmOpenDevice(dev_t dev, int minor, int type)
     int             isroot  = !geteuid();
     uid_t           user    = DRM_DEV_UID;
     gid_t           group   = DRM_DEV_GID;
+#endif
+
+#ifdef DRM_FE
+	struct drm_interface_fe *drm_intf_fe = get_drm_fe();
+	if (!drm_intf_fe)
+		return -EINVAL;
+	if((fd = drm_intf_fe->drmopen_fe(minor, type)) >= 0) {
+		drm_place_marker("M - USER Virtual Display FE ready");
+		return fd;
+	}
 #endif
 
     if (!dev_name)
@@ -1756,6 +1839,9 @@ drm_public int drmClose(int fd)
 {
     unsigned long key    = drmGetKeyFromFd(fd);
     drmHashEntry  *entry = drmGetEntry(fd);
+#ifdef DRM_FE
+    struct drm_interface_fe *drm_intf_fe;
+#endif
 
     drmHashDestroy(entry->tagTable);
     entry->fd       = 0;
@@ -1764,7 +1850,11 @@ drm_public int drmClose(int fd)
 
     drmHashDelete(drmHashTable, key);
     drmFree(entry);
-
+#ifdef DRM_FE
+    drm_intf_fe = get_drm_fe();
+    if (drm_intf_fe)
+        drm_intf_fe->drmclose_fe(fd);
+#endif
     return close(fd);
 }
 
@@ -2685,7 +2775,11 @@ drm_public int drmWaitVBlank(int fd, drmVBlankPtr vbl)
     timeout.tv_sec++;
 
     do {
+#ifdef DRM_FE
+       ret = drmIoctl(fd, DRM_IOCTL_WAIT_VBLANK, vbl);
+#else
        ret = ioctl(fd, DRM_IOCTL_WAIT_VBLANK, vbl);
+#endif
        vbl->request.type &= ~DRM_VBLANK_RELATIVE;
        if (ret && errno == EINTR) {
            clock_gettime(CLOCK_MONOTONIC, &cur);

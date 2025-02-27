@@ -115,3 +115,9 @@ option(
   value : true,
   description : 'Build test programs.',
 )
+option(
+  'enable_drm-fe',
+  type: 'string',
+  value: '',
+  description : 'Have DRM front-end support',
+)
