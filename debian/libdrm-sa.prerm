@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -e
+
+LIBDIR="/usr/lib/aarch64-linux-gnu"
+SONAME="libdrm.so.2"
+TARGET="libdrm.so.2.4.0"
+
+case "$1" in
+    remove|deconfigure)
+        if [ -L "${LIBDIR}/${SONAME}" ]; then
+            current=$(readlink "${LIBDIR}/${SONAME}" 2>/dev/null || true)
+            if [ "${current}" = "${TARGET}" ]; then
+                echo "libdrm-sa: removing ${LIBDIR}/${SONAME} symlink"
+                rm -f "${LIBDIR}/${SONAME}"
+            fi
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

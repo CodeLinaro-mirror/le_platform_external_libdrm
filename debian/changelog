@@ -1,0 +1,9 @@
+libdrm-sa (2.4.120-sa1) noble; urgency=medium
+
+  * Qualcomm-only build based on upstream libdrm 2.4.120.
+  * Renamed all packages from libdrm* to libdrm-qcom*.
+  * Disabled non-Qualcomm vendor drivers: intel, nouveau, radeon, amdgpu,
+    omap, exynos, tegra, etnaviv.
+  * Enabled freedreno + freedreno-kgsl for Adreno GPU support.
+
+ --  Chen Sun <chesun@qti.qualcomm.com> Wed, 09 Apr 2026 12:00:00 +0000
