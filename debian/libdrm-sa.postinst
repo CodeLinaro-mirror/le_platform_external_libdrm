@@ -1,0 +1,32 @@
+#!/bin/sh
+
+set -e
+
+LIBDIR="/usr/lib/aarch64-linux-gnu"
+SONAME="libdrm.so.2"
+TARGET="libdrm.so.2.4.0"
+
+case "$1" in
+    configure|triggered)
+        i=0
+        for f in "${LIBDIR}"/libdrm.so.2.1*; do
+            [ -e "$f" ] || continue
+            newname="${LIBDIR}/libdrm.so.2.0.${i}"
+            echo "libdrm-sa: renaming $f -> ${newname}"
+            mv "$f" "${newname}"
+            i=$((i + 1))
+        done
+        if [ -e "${LIBDIR}/${TARGET}" ]; then
+            echo "libdrm-sa: setting ${LIBDIR}/${SONAME} -> ${TARGET}"
+            ln -sf "${TARGET}" "${LIBDIR}/${SONAME}"
+        fi
+        ;;
+esac
+
+if [ -x /sbin/ldconfig ]; then
+    /sbin/ldconfig
+fi
+
+#DEBHELPER#
+
+exit 0

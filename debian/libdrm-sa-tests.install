@@ -1,0 +1,5 @@
+usr/bin/drmdevice
+usr/bin/modeprint
+usr/bin/modetest
+usr/bin/proptest
+usr/bin/vbltest

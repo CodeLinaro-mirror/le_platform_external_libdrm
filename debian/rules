@@ -1,0 +1,80 @@
+#!/usr/bin/make -f
+
+#export DH_VERBOSE = 1
+
+LIBDRM_VERSION  ?= 2.4.120
+export LIBDRM_VERSION
+
+LIBDRM_SRCDIR   ?= $(CURDIR)
+export LIBDRM_SRCDIR
+
+DEB_HOST_ARCH     ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEB_HOST_ARCH_OS  ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_OS)
+DEB_HOST_ARCH_CPU ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_CPU)
+
+%:
+	dh $@
+
+confflags = \
+	--auto-features=disabled \
+	-Ddefault_library=both \
+	-Dman-pages=disabled \
+	-Dvalgrind=disabled \
+	-Dintel=disabled \
+	-Dnouveau=disabled \
+	-Dradeon=disabled \
+	-Damdgpu=disabled \
+	-Domap=disabled \
+	-Dexynos=disabled \
+	-Dtegra=disabled \
+	-Detnaviv=disabled \
+	-Dinstall-test-programs=true \
+	-Denable_drm-fe=yes \
+	-Dfreedreno=disabled \
+	$(NULL)
+
+# udev on Linux
+ifeq (linux, $(DEB_HOST_ARCH_OS))
+	confflags += -Dudev=true
+	confflags += -Dvmwgfx=disabled
+else
+	confflags += -Dudev=false
+	confflags += -Dvmwgfx=disabled
+endif
+
+# Skip autoreconf
+override_dh_autoreconf:
+	@echo "Skipping autoreconf: build system is Meson"
+
+override_dh_auto_configure:
+	dh_auto_configure --sourcedirectory=$(LIBDRM_SRCDIR) -- $(confflags)
+
+override_dh_auto_build:
+	dh_auto_build --sourcedirectory=$(LIBDRM_SRCDIR)
+
+override_dh_auto_install:
+	dh_auto_install --sourcedirectory=$(LIBDRM_SRCDIR)
+
+override_dh_install:
+	find debian/tmp -name '*.la' -delete
+	install -m 644 $(LIBDRM_SRCDIR)/libdrm_macros.h \
+		debian/tmp/usr/include/libdrm_macros.h
+	install -d debian/libdrm-sa-common
+	dh_install --remaining-packages
+
+override_dh_makeshlibs:
+	dh_makeshlibs -plibdrm-sa -V'libdrm-sa (>= 2.4.89)' --add-udeb=libdrm-sa-udeb -- -c4
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym || true
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info || true
+
+override_dh_clean:
+	dh_clean
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0755 debian/libdrm-sa/DEBIAN/postinst 2>/dev/null || true
+	chmod 0755 debian/libdrm-sa/DEBIAN/prerm 2>/dev/null || true

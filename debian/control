@@ -1,0 +1,62 @@
+Source: libdrm-sa
+Section: libs
+Priority: optional
+Maintainer: Chen Sun <chesun@qti.qualcomm.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ meson,
+ pkg-config,
+ libudev-dev [linux-any],
+ python3-docutils,
+ python3-setuptools,
+Standards-Version: 4.6.2
+Homepage: https://gitlab.freedesktop.org/mesa/drm/
+Rules-Requires-Root: no
+
+Package: libdrm-sa
+Section: libs
+Architecture: linux-any hurd-any
+Multi-Arch: same
+Pre-Depends: ${misc:Pre-Depends}
+Depends: libdrm-sa-common (>= ${source:Version}), ${shlibs:Depends}, ${misc:Depends}
+Provides: libdrm2
+Replaces: libdrm2
+Description: Userspace interface to kernel DRM services (Qualcomm)
+ This library implements the userspace interface to the kernel DRM
+ services. DRM stands for "Direct Rendering Manager", which is the
+ kernel portion of the "Direct Rendering Infrastructure" (DRI).
+ .
+ This is the Qualcomm-specific build of libdrm 2.4.120.
+
+Package: libdrm-sa-common
+Section: libs
+Architecture: arm64
+Multi-Arch: foreign
+Depends: ${misc:Depends}
+Description: Userspace interface to kernel DRM services -- common files (Qualcomm)
+ This package provides common files (data, etc.) for the Qualcomm
+ libdrm build.
+
+Package: libdrm-sa-dev
+Section: libdevel
+Architecture: linux-any hurd-any
+Multi-Arch: same
+Depends:
+ libdrm-sa (= ${binary:Version}),
+ ${misc:Depends},
+Description: Userspace interface to kernel DRM services -- development files (Qualcomm)
+ This package provides the development headers for the Qualcomm libdrm build.
+
+Package: libdrm-sa-tests
+Section: misc
+Architecture: any
+Depends: libdrm-sa (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: Userspace interface to kernel DRM services -- test programs (Qualcomm)
+ This package provides test programs for the Qualcomm libdrm build.
+
+Package: libdrm-sa-udeb
+Package-Type: udeb
+Section: debian-installer
+Architecture: linux-any hurd-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Userspace interface to kernel DRM services (udeb, Qualcomm)
